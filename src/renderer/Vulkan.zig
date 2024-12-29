@@ -15,7 +15,9 @@ const font = @import("../font/main.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 
-alloc: Allocator,
+const Graphics = @import("vulkan/Graphics.zig");
+
+a: Allocator,
 
 config: DerivedConfig,
 
@@ -38,6 +40,11 @@ cursor_invert: bool,
 
 /// The mailbox for communicating with the window.
 surface_mailbox: apprt.surface.Mailbox,
+
+/// Vulkan GPU state.
+/// Initialization of the Vulkan GPU state is deferred until `finalizeSurfaceInit`,
+/// as we require the surface in order to pick the right rendering device.
+graphics: ?Graphics = null,
 
 pub const DerivedConfig = struct {
     arena: ArenaAllocator,
@@ -73,9 +80,9 @@ pub const DerivedConfig = struct {
     }
 };
 
-pub fn init(alloc: Allocator, options: renderer.Options) !Vulkan {
+pub fn init(a: Allocator, options: renderer.Options) !Vulkan {
     return .{
-        .alloc = alloc,
+        .a = a,
         .config = options.config,
         .foreground_color = options.config.foreground,
         .background_color = options.config.background,
@@ -86,6 +93,7 @@ pub fn init(alloc: Allocator, options: renderer.Options) !Vulkan {
 }
 
 pub fn deinit(self: *Vulkan) void {
+    if (self.graphics) |*g| g.deinit();
     self.* = undefined;
 }
 
@@ -101,67 +109,69 @@ pub fn glfwWindowHints(config: *const configpkg.Config) glfw.Window.Hints {
 
 pub fn surfaceInit(surface: *apprt.Surface) !void {
     _ = surface;
-    unreachable; // TODO
+
+    // We don't do anything else here because we want to set everything
+    // else up during actual initialization.
 }
 
-pub fn finalizeSurfaceInit(self: *const Vulkan, surface: *apprt.Surface) !void {
-    _ = self;
-    _ = surface;
-    unreachable; // TODO
+pub fn finalizeSurfaceInit(self: *Vulkan, surface: *apprt.Surface) !void {
+    self.graphics = try Graphics.init(self.a, surface);
 }
 
 pub fn displayUnrealized(self: *Vulkan) void {
     _ = self;
-    unreachable; // TODO
+    // TODO
 }
 
 pub fn displayRealize(self: *Vulkan) !void {
     _ = self;
-    unreachable; // TODO
+    // TODO
 }
 
 pub fn threadEnter(self: *const Vulkan, surface: *apprt.Surface) !void {
     _ = self;
     _ = surface;
-    unreachable; // TODO
+
+    // Vulkan requires no per-thread state.
 }
 
 pub fn threadExit(self: *const Vulkan) void {
     _ = self;
-    unreachable; // TODO
+
+    // Vulkan requires no per-thread state.
 }
 
 pub fn hasAnimations(self: *const Vulkan) bool {
     _ = self;
-    unreachable; // TODO
+    return false; // TODO: Custom shaders.
 }
 
 pub fn hasVsync(self: *const Vulkan) bool {
     _ = self;
-    unreachable; // TODO
+    return false; // TODO
 }
 
 pub fn markDirty(self: *Vulkan) void {
     _ = self;
-    unreachable; // TODO
+    // TODO
 }
 
 pub fn setFocus(self: *Vulkan, focus: bool) !void {
     _ = self;
     _ = focus;
-    unreachable; // TODO
+    // TODO
 }
 
 pub fn setVisible(self: *Vulkan, visible: bool) void {
     _ = self;
     _ = visible;
-    unreachable; // TODO
+    // TODO
 }
 
 pub fn setFontGrid(self: *Vulkan, grid: *font.SharedGrid) void {
     _ = self;
     _ = grid;
-    unreachable; // TODO
+    // TODO
 }
 
 pub fn updateFrame(
@@ -174,7 +184,6 @@ pub fn updateFrame(
     _ = surface;
     _ = state;
     _ = cursor_blink_visible;
-    unreachable; // TODO
 }
 
 pub fn rebuildCells(
@@ -195,13 +204,13 @@ pub fn rebuildCells(
     _ = preedit;
     _ = cursor_style_;
     _ = color_palette;
-    unreachable; // TODO
+    // TODO
 }
 
 pub fn changeConfig(self: *Vulkan, config: *DerivedConfig) !void {
     _ = self;
     _ = config;
-    unreachable; // TODO
+    // TODO
 }
 
 pub fn setScreenSize(
@@ -210,11 +219,11 @@ pub fn setScreenSize(
 ) !void {
     _ = self;
     _ = size;
-    unreachable; // TODO
+    // TODO
 }
 
 pub fn drawFrame(self: *Vulkan, surface: *apprt.Surface) !void {
     _ = self;
     _ = surface;
-    unreachable; // TODO
+    // TODO
 }
