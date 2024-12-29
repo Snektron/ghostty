@@ -9,6 +9,8 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 
 const builtin = @import("builtin");
 const glfw = @import("glfw");
+const vk = @import("vulkan");
+
 const configpkg = @import("../config.zig");
 const apprt = @import("../apprt.zig");
 const font = @import("../font/main.zig");
@@ -17,6 +19,9 @@ const terminal = @import("../terminal/main.zig");
 
 const Graphics = @import("vulkan/Graphics.zig");
 const Swapchain = @import("vulkan/Swapchain.zig");
+
+const frame_timeout = 1 * std.time.ns_per_s;
+const frames_in_flight = 3;
 
 a: Allocator,
 
@@ -50,6 +55,8 @@ gpu_state: ?GPUState = null,
 const GPUState = struct {
     graphics: Graphics,
     swapchain: Swapchain,
+    frames: [frames_in_flight]Frame,
+    frame_nr: usize = 0,
 };
 
 pub const DerivedConfig = struct {
@@ -100,6 +107,20 @@ pub fn init(a: Allocator, options: renderer.Options) !Vulkan {
 
 pub fn deinit(self: *Vulkan) void {
     if (self.gpu_state) |*state| {
+        self.waitForAllFrames() catch |err| switch (err) {
+            error.Timeout => {
+                log.err("frame timeout while deinitializing", .{});
+                std.time.sleep(frame_timeout);
+            },
+            // We usually cannot really recover from any other error here,
+            // but lets try to continue deinitializing anyway...
+            else => {},
+        };
+
+        for (&state.frames) |*frame| {
+            frame.deinit(state.graphics);
+        }
+
         state.swapchain.deinit(state.graphics);
         state.graphics.deinit();
     }
@@ -140,9 +161,24 @@ pub fn finalizeSurfaceInit(self: *Vulkan, surface: *apprt.Surface) !void {
     });
     errdefer swapchain.deinit(graphics);
 
+    var frames: [frames_in_flight]Frame = undefined;
+    var n_successfully_created: usize = 0;
+
+    errdefer {
+        for (frames[0..n_successfully_created]) |*frame| {
+            frame.deinit(graphics);
+        }
+    }
+
+    for (&frames) |*frame| {
+        frame.* = try Frame.init(graphics);
+        n_successfully_created += 1;
+    }
+
     self.gpu_state = .{
         .graphics = graphics,
         .swapchain = swapchain,
+        .frames = frames,
     };
 }
 
@@ -251,7 +287,104 @@ pub fn setScreenSize(
 }
 
 pub fn drawFrame(self: *Vulkan, surface: *apprt.Surface) !void {
-    _ = self;
     _ = surface;
-    // TODO
+    const state = if (self.gpu_state) |*state| state else return;
+
+    const frame = &state.frames[state.frame_nr % frames_in_flight];
+    try frame.wait(state.graphics);
+
+    const present_state = state.swapchain.acquireNextImage(state.graphics, frame.image_acquired) catch |err| switch (err) {
+        error.OutOfDateKHR => .suboptimal,
+        else => |other| return other,
+    };
+
+    if (present_state == .suboptimal) {
+        // TODO: Check deferred size?
+        log.warn("TODO: Resize swapchain", .{});
+    }
+
+    try state.graphics.dev.resetCommandPool(frame.cmd_pool, .{});
+    try state.graphics.dev.beginCommandBuffer(frame.cmd_buf, &.{
+        .flags = .{ .one_time_submit_bit = true },
+    });
+
+    try state.graphics.dev.endCommandBuffer(frame.cmd_buf);
+
+    const submit_info: vk.SubmitInfo = .{
+        .wait_semaphore_count = 1,
+        .p_wait_semaphores = @ptrCast(&frame.image_acquired),
+        .p_wait_dst_stage_mask = &.{.{ .bottom_of_pipe_bit = true }},
+        .command_buffer_count = 1,
+        .p_command_buffers = @ptrCast(&frame.cmd_buf),
+        .signal_semaphore_count = 1,
+        .p_signal_semaphores = @ptrCast(&frame.render_finished),
+    };
+    try state.graphics.dev.queueSubmit(state.graphics.graphics_queue.handle, 1, @ptrCast(&submit_info), frame.frame_fence);
+
+    try state.swapchain.present(state.graphics, &.{frame.render_finished});
+
+    state.frame_nr += 1;
 }
+
+fn waitForAllFrames(self: *Vulkan) !void {
+    const state = if (self.gpu_state) |*state| state else return;
+    for (state.frames) |frame| try frame.wait(state.graphics);
+}
+
+const Frame = struct {
+    image_acquired: vk.Semaphore,
+    render_finished: vk.Semaphore,
+    frame_fence: vk.Fence,
+    cmd_pool: vk.CommandPool,
+    cmd_buf: vk.CommandBuffer,
+
+    fn init(graphics: Graphics) !Frame {
+        const image_acquired = try graphics.dev.createSemaphore(&.{}, null);
+        errdefer graphics.dev.destroySemaphore(image_acquired, null);
+
+        const render_finished = try graphics.dev.createSemaphore(&.{}, null);
+        errdefer graphics.dev.destroySemaphore(render_finished, null);
+
+        const frame_fence = try graphics.dev.createFence(&.{ .flags = .{ .signaled_bit = true } }, null);
+        errdefer graphics.dev.destroyFence(frame_fence, null);
+
+        const cmd_pool = try graphics.dev.createCommandPool(&.{
+            .flags = .{},
+            .queue_family_index = graphics.graphics_queue.family,
+        }, null);
+        errdefer graphics.dev.destroyCommandPool(cmd_pool, null);
+
+        var cmd_buf: vk.CommandBuffer = undefined;
+        try graphics.dev.allocateCommandBuffers(&.{
+            .command_pool = cmd_pool,
+            .level = .primary,
+            .command_buffer_count = 1,
+        }, @ptrCast(&cmd_buf));
+
+        return .{
+            .image_acquired = image_acquired,
+            .render_finished = render_finished,
+            .frame_fence = frame_fence,
+            .cmd_pool = cmd_pool,
+            .cmd_buf = cmd_buf,
+        };
+    }
+
+    fn deinit(self: *Frame, graphics: Graphics) void {
+        // Destroying a command pool will also free its associated command buffers.
+        graphics.dev.destroyCommandPool(self.cmd_pool, null);
+        graphics.dev.destroyFence(self.frame_fence, null);
+        graphics.dev.destroySemaphore(self.render_finished, null);
+        graphics.dev.destroySemaphore(self.image_acquired, null);
+        self.* = undefined;
+    }
+
+    fn wait(self: Frame, graphics: Graphics) !void {
+        const result = try graphics.dev.waitForFences(1, @ptrCast(&self.frame_fence), vk.TRUE, frame_timeout);
+        if (result == .timeout) {
+            return error.Timeout;
+        }
+
+        try graphics.dev.resetFences(1, @ptrCast(&self.frame_fence));
+    }
+};

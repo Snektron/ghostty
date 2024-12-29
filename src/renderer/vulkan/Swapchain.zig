@@ -151,7 +151,7 @@ pub const PresentState = enum {
 /// pixel layout, for example), .suboptimal is returned. When this function returns error.OutOfDateKHR (or .suboptimal)
 /// `self.reinit` should be called.
 pub fn acquireNextImage(self: *Swapchain, graphics: Graphics, image_acquired: vk.Semaphore) !PresentState {
-    const result = try graphics.dev.acquireNextImage(self.handle, acquire_timeout, image_acquired, .null_handle);
+    const result = try graphics.dev.acquireNextImageKHR(self.handle, acquire_timeout, image_acquired, .null_handle);
     self.image_index = result.image_index;
 
     return switch (result.result) {
@@ -159,18 +159,19 @@ pub fn acquireNextImage(self: *Swapchain, graphics: Graphics, image_acquired: vk
         .suboptimal_khr => PresentState.suboptimal,
         .not_ready => unreachable, // Only reachable if timeout is zero
         .timeout => return error.AcquireTimeout,
+        else => unreachable,
     };
 }
 
 /// Schedule the current swap image (self.image_index) for presentation. `wait_semaphores` is a list of
 /// semaphores to wait on before presentation.
 pub fn present(self: *Swapchain, graphics: Graphics, wait_semaphores: []const vk.Semaphore) !void {
-    _ = try graphics.dev.queuePresentKHR(graphics.present_queue.handle, .{
+    _ = try graphics.dev.queuePresentKHR(graphics.present_queue.handle, &.{
         .wait_semaphore_count = @intCast(wait_semaphores.len),
         .p_wait_semaphores = wait_semaphores.ptr,
         .swapchain_count = 1,
-        .p_swapchains = &self.handle,
-        .p_image_indices = &self.image_index,
+        .p_swapchains = @ptrCast(&self.handle),
+        .p_image_indices = @ptrCast(&self.image_index),
         .p_results = null,
     });
 }
