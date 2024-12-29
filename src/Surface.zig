@@ -450,64 +450,72 @@ pub fn init(
         break :size size;
     };
 
-    // Create our terminal grid with the initial size
     const app_mailbox: App.Mailbox = .{ .rt_app = rt_app, .mailbox = &app.mailbox };
-    var renderer_impl = try Renderer.init(alloc, .{
-        .config = try Renderer.DerivedConfig.init(alloc, config),
-        .font_grid = font_grid,
-        .size = size,
-        .surface_mailbox = .{ .surface = self, .app = app_mailbox },
-        .rt_surface = rt_surface,
-    });
-    errdefer renderer_impl.deinit();
 
-    // The mutex used to protect our renderer state.
-    const mutex = try alloc.create(std.Thread.Mutex);
-    mutex.* = .{};
-    errdefer alloc.destroy(mutex);
+    {
+        // Create our terminal grid with the initial size
+        var renderer_impl: Renderer = try Renderer.init(alloc, .{
+            .config = try Renderer.DerivedConfig.init(alloc, config),
+            .font_grid = font_grid,
+            .size = size,
+            .surface_mailbox = .{ .surface = self, .app = app_mailbox },
+            .rt_surface = rt_surface,
+        });
+        errdefer renderer_impl.deinit();
 
-    // Create the renderer thread
-    var render_thread = try renderer.Thread.init(
-        alloc,
-        config,
-        rt_surface,
-        &self.renderer,
-        &self.renderer_state,
-        app_mailbox,
-    );
-    errdefer render_thread.deinit();
+        // The mutex used to protect our renderer state.
+        const mutex = try alloc.create(std.Thread.Mutex);
+        mutex.* = .{};
+        errdefer alloc.destroy(mutex);
 
-    // Create the IO thread
-    var io_thread = try termio.Thread.init(alloc);
-    errdefer io_thread.deinit();
+        // Create the renderer thread
+        var render_thread = try renderer.Thread.init(
+            alloc,
+            config,
+            rt_surface,
+            &self.renderer,
+            &self.renderer_state,
+            app_mailbox,
+        );
+        errdefer render_thread.deinit();
 
-    self.* = .{
-        .alloc = alloc,
-        .app = app,
-        .rt_app = rt_app,
-        .rt_surface = rt_surface,
-        .font_grid_key = font_grid_key,
-        .font_size = font_size,
-        .font_metrics = font_grid.metrics,
-        .renderer = renderer_impl,
-        .renderer_thread = render_thread,
-        .renderer_state = .{
-            .mutex = mutex,
-            .terminal = &self.io.terminal,
-        },
-        .renderer_thr = undefined,
-        .mouse = .{},
-        .keyboard = .{},
-        .io = undefined,
-        .io_thread = io_thread,
-        .io_thr = undefined,
-        .size = size,
-        .config = derived_config,
+        // Create the IO thread
+        var io_thread = try termio.Thread.init(alloc);
+        errdefer io_thread.deinit();
 
-        // Our conditional state is initialized to the app state. This
-        // lets us get the most likely correct color theme and so on.
-        .config_conditional_state = app.config_conditional_state,
-    };
+        self.* = .{
+            .alloc = alloc,
+            .app = app,
+            .rt_app = rt_app,
+            .rt_surface = rt_surface,
+            .font_grid_key = font_grid_key,
+            .font_size = font_size,
+            .font_metrics = font_grid.metrics,
+            .renderer = renderer_impl,
+            .renderer_thread = render_thread,
+            .renderer_state = .{
+                .mutex = mutex,
+                .terminal = &self.io.terminal,
+            },
+            .renderer_thr = undefined,
+            .mouse = .{},
+            .keyboard = .{},
+            .io = undefined,
+            .io_thread = io_thread,
+            .io_thr = undefined,
+            .size = size,
+            .config = derived_config,
+
+            // Our conditional state is initialized to the app state. This
+            // lets us get the most likely correct color theme and so on.
+            .config_conditional_state = app.config_conditional_state,
+        };
+    }
+
+    errdefer self.renderer.deinit();
+    errdefer self.renderer_thread.deinit();
+    errdefer alloc.destroy(self.renderer_state.mutex);
+    errdefer self.io_thread.deinit();
 
     // The command we're going to execute
     const command: ?[]const u8 = if (app.first)
@@ -551,8 +559,8 @@ pub fn init(
             .backend = .{ .exec = io_exec },
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
-            .renderer_wakeup = render_thread.wakeup,
-            .renderer_mailbox = render_thread.mailbox,
+            .renderer_wakeup = self.renderer_thread.wakeup,
+            .renderer_mailbox = self.renderer_thread.mailbox,
             .surface_mailbox = .{ .surface = self, .app = app_mailbox },
         });
     }
@@ -590,7 +598,7 @@ pub fn init(
 
     // Give the renderer one more opportunity to finalize any surface
     // setup on the main thread prior to spinning up the rendering thread.
-    try renderer_impl.finalizeSurfaceInit(rt_surface);
+    try self.renderer.finalizeSurfaceInit(rt_surface);
 
     // Start our renderer thread
     self.renderer_thr = try std.Thread.spawn(
