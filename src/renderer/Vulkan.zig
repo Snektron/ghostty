@@ -44,6 +44,10 @@ cursor_color: ?terminal.color.RGB,
 /// foreground color as the cursor color.
 cursor_invert: bool,
 
+/// Current background to draw. This may not match self.background if the
+/// terminal is in reversed mode.
+draw_background: terminal.color.RGB,
+
 /// The mailbox for communicating with the window.
 surface_mailbox: apprt.surface.Mailbox,
 
@@ -65,6 +69,7 @@ pub const DerivedConfig = struct {
     cursor_color: ?terminal.color.RGB,
     cursor_invert: bool,
     background: terminal.color.RGB,
+    background_opacity: f64,
     foreground: terminal.color.RGB,
 
     pub fn init(
@@ -83,6 +88,7 @@ pub const DerivedConfig = struct {
                 null,
             .cursor_invert = cursor_invert,
             .background = config.background.toTerminalRGB(),
+            .background_opacity = @max(0, @min(1, config.@"background-opacity")),
             .foreground = config.foreground.toTerminalRGB(),
             .arena = arena,
         };
@@ -101,6 +107,7 @@ pub fn init(a: Allocator, options: renderer.Options) !Vulkan {
         .background_color = options.config.background,
         .cursor_color = options.config.cursor_color,
         .cursor_invert = options.config.cursor_invert,
+        .draw_background = options.config.background,
         .surface_mailbox = options.surface_mailbox,
     };
 }
@@ -116,6 +123,11 @@ pub fn deinit(self: *Vulkan) void {
             // but lets try to continue deinitializing anyway...
             else => {},
         };
+
+        // Waiting on the fences above does not actually guarantee that the swapchain has finished
+        // rendering, so explicitly wait for the queue to be finalized before destroying the
+        // (potentially in use) frame's resources.
+        state.graphics.dev.queueWaitIdle(state.graphics.present_queue.handle) catch {};
 
         for (&state.frames) |*frame| {
             frame.deinit(state.graphics);
@@ -289,9 +301,12 @@ pub fn setScreenSize(
 pub fn drawFrame(self: *Vulkan, surface: *apprt.Surface) !void {
     _ = surface;
     const state = if (self.gpu_state) |*state| state else return;
+    const dev = state.graphics.dev;
 
     const frame = &state.frames[state.frame_nr % frames_in_flight];
     try frame.wait(state.graphics);
+
+    const cmd_buf = frame.cmd_buf;
 
     const present_state = state.swapchain.acquireNextImage(state.graphics, frame.image_acquired) catch |err| switch (err) {
         error.OutOfDateKHR => .suboptimal,
@@ -303,23 +318,122 @@ pub fn drawFrame(self: *Vulkan, surface: *apprt.Surface) !void {
         log.warn("TODO: Resize swapchain", .{});
     }
 
-    try state.graphics.dev.resetCommandPool(frame.cmd_pool, .{});
-    try state.graphics.dev.beginCommandBuffer(frame.cmd_buf, &.{
+    try dev.resetCommandPool(frame.cmd_pool, .{});
+    try dev.beginCommandBuffer(cmd_buf, &.{
         .flags = .{ .one_time_submit_bit = true },
     });
 
-    try state.graphics.dev.endCommandBuffer(frame.cmd_buf);
+    {
+        // Dynamic rendering does not automatically transition the render pass into the present state.
+        // We have to do that manually...
+        const image_mbar: vk.ImageMemoryBarrier = .{
+            .src_access_mask = .{},
+            .dst_access_mask = .{ .color_attachment_write_bit = true },
+            // At this point, the image may actually either be in truly undefined layout,
+            // or in present_src_khr layout. We don't care about the contents, so
+            // just use undefined here.
+            .old_layout = .undefined,
+            .new_layout = .color_attachment_optimal,
+            .src_queue_family_index = state.graphics.present_queue.family,
+            .dst_queue_family_index = state.graphics.graphics_queue.family,
+            .image = state.swapchain.images[state.swapchain.image_index],
+            .subresource_range = .{
+                .aspect_mask = .{ .color_bit = true },
+                .base_mip_level = 0,
+                .level_count = 1,
+                .base_array_layer = 0,
+                .layer_count = 1,
+            },
+        };
+        dev.cmdPipelineBarrier(
+            cmd_buf,
+            .{ .top_of_pipe_bit = true },
+            .{ .color_attachment_output_bit = true },
+            .{},
+            0,
+            null,
+            0,
+            null,
+            1,
+            @ptrCast(&image_mbar),
+        );
+    }
+
+    const color_attachment: vk.RenderingAttachmentInfo = .{
+        .image_view = state.swapchain.image_views[state.swapchain.image_index],
+        .image_layout = .color_attachment_optimal,
+        .resolve_mode = .{},
+        .resolve_image_layout = .undefined, // Not used.
+        .load_op = .clear,
+        .store_op = .store,
+        .clear_value = .{ .color = .{
+            .float_32 = .{
+                @floatCast(@as(f32, @floatFromInt(self.draw_background.r)) / 255 * self.config.background_opacity),
+                @floatCast(@as(f32, @floatFromInt(self.draw_background.g)) / 255 * self.config.background_opacity),
+                @floatCast(@as(f32, @floatFromInt(self.draw_background.b)) / 255 * self.config.background_opacity),
+                @floatCast(self.config.background_opacity),
+            },
+        } },
+    };
+
+    dev.cmdBeginRendering(cmd_buf, &.{
+        .render_area = .{
+            .offset = .{ .x = 0, .y = 0 },
+            .extent = state.swapchain.extent,
+        },
+        .layer_count = 1,
+        .view_mask = 0,
+        .color_attachment_count = 1,
+        .p_color_attachments = @ptrCast(&color_attachment),
+    });
+
+    dev.cmdEndRendering(cmd_buf);
+
+    {
+        // Dynamic rendering does not automatically transition the render pass into the present state.
+        // We have to do that manually...
+        const image_mbar: vk.ImageMemoryBarrier = .{
+            .src_access_mask = .{ .color_attachment_write_bit = true },
+            .dst_access_mask = .{},
+            .old_layout = .color_attachment_optimal,
+            .new_layout = .present_src_khr,
+            .src_queue_family_index = state.graphics.graphics_queue.family,
+            .dst_queue_family_index = state.graphics.present_queue.family,
+            .image = state.swapchain.images[state.swapchain.image_index],
+            .subresource_range = .{
+                .aspect_mask = .{ .color_bit = true },
+                .base_mip_level = 0,
+                .level_count = 1,
+                .base_array_layer = 0,
+                .layer_count = 1,
+            },
+        };
+        dev.cmdPipelineBarrier(
+            cmd_buf,
+            .{ .color_attachment_output_bit = true },
+            .{ .bottom_of_pipe_bit = true },
+            .{},
+            0,
+            null,
+            0,
+            null,
+            1,
+            @ptrCast(&image_mbar),
+        );
+    }
+
+    try dev.endCommandBuffer(cmd_buf);
 
     const submit_info: vk.SubmitInfo = .{
         .wait_semaphore_count = 1,
         .p_wait_semaphores = @ptrCast(&frame.image_acquired),
         .p_wait_dst_stage_mask = &.{.{ .bottom_of_pipe_bit = true }},
         .command_buffer_count = 1,
-        .p_command_buffers = @ptrCast(&frame.cmd_buf),
+        .p_command_buffers = @ptrCast(&cmd_buf),
         .signal_semaphore_count = 1,
         .p_signal_semaphores = @ptrCast(&frame.render_finished),
     };
-    try state.graphics.dev.queueSubmit(state.graphics.graphics_queue.handle, 1, @ptrCast(&submit_info), frame.frame_fence);
+    try dev.queueSubmit(state.graphics.graphics_queue.handle, 1, @ptrCast(&submit_info), frame.frame_fence);
 
     try state.swapchain.present(state.graphics, &.{frame.render_finished});
 

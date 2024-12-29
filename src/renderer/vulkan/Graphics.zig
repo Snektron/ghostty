@@ -12,8 +12,14 @@ const build_config = @import("../../build_config.zig");
 
 const required_device_extensions = [_][*:0]const u8{vk.extensions.khr_swapchain.name};
 
+const required_dynamic_rendering_features: vk.PhysicalDeviceDynamicRenderingFeatures = .{
+    .dynamic_rendering = vk.TRUE,
+};
+
 const apis = &.{
     vk.features.version_1_0,
+    vk.features.version_1_1,
+    vk.features.version_1_3,
     vk.extensions.khr_surface,
     vk.extensions.khr_swapchain,
 };
@@ -94,7 +100,8 @@ pub fn init(a: Allocator, surface: *apprt.Surface) !Graphics {
             .application_version = version,
             .p_engine_name = "Ghostty Vulkan Renderer",
             .engine_version = version,
-            .api_version = vk.API_VERSION_1_0,
+            // We require Vulkan 1.3 for dynamic rendering.
+            .api_version = vk.API_VERSION_1_3,
         },
         .enabled_extension_count = @intCast(instance_exts.len),
         .pp_enabled_extension_names = instance_exts.ptr,
@@ -250,6 +257,7 @@ const DeviceCandidate = struct {
         const queue_count: u32 = if (same_family) 1 else 2;
 
         return try instance.createDevice(candidate.pdev, &.{
+            .p_next = @ptrCast(&required_dynamic_rendering_features),
             .queue_create_info_count = queue_count,
             .p_queue_create_infos = &qci,
             .enabled_extension_count = required_device_extensions.len,
@@ -264,6 +272,10 @@ const DeviceCandidate = struct {
         a: Allocator,
     ) !?DeviceCandidate {
         if (!try checkExtensionSupport(instance, pdev, a)) {
+            return null;
+        }
+
+        if (!try checkFeatureSupport(instance, pdev)) {
             return null;
         }
 
@@ -348,6 +360,29 @@ const DeviceCandidate = struct {
                     break;
                 }
             } else {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    fn checkFeatureSupport(
+        instance: Instance,
+        pdev: vk.PhysicalDevice,
+    ) !bool {
+        var dynamic_rendering_features: vk.PhysicalDeviceDynamicRenderingFeatures = .{};
+        var features2: vk.PhysicalDeviceFeatures2 = .{
+            .p_next = @ptrCast(&dynamic_rendering_features),
+            .features = .{},
+        };
+        instance.getPhysicalDeviceFeatures2(pdev, &features2);
+
+        inline for (std.meta.fields(vk.PhysicalDeviceDynamicRenderingFeatures)) |field| {
+            if (field.type == vk.Bool32 and
+                @field(required_dynamic_rendering_features, field.name) == vk.TRUE and
+                @field(dynamic_rendering_features, field.name) == vk.FALSE)
+            {
                 return false;
             }
         }
