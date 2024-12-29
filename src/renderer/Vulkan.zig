@@ -16,6 +16,7 @@ const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 
 const Graphics = @import("vulkan/Graphics.zig");
+const Swapchain = @import("vulkan/Swapchain.zig");
 
 a: Allocator,
 
@@ -44,7 +45,12 @@ surface_mailbox: apprt.surface.Mailbox,
 /// Vulkan GPU state.
 /// Initialization of the Vulkan GPU state is deferred until `finalizeSurfaceInit`,
 /// as we require the surface in order to pick the right rendering device.
-graphics: ?Graphics = null,
+gpu_state: ?GPUState = null,
+
+const GPUState = struct {
+    graphics: Graphics,
+    swapchain: Swapchain,
+};
 
 pub const DerivedConfig = struct {
     arena: ArenaAllocator,
@@ -93,7 +99,10 @@ pub fn init(a: Allocator, options: renderer.Options) !Vulkan {
 }
 
 pub fn deinit(self: *Vulkan) void {
-    if (self.graphics) |*g| g.deinit();
+    if (self.gpu_state) |*state| {
+        state.swapchain.deinit(state.graphics);
+        state.graphics.deinit();
+    }
     self.* = undefined;
 }
 
@@ -115,7 +124,26 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
 }
 
 pub fn finalizeSurfaceInit(self: *Vulkan, surface: *apprt.Surface) !void {
-    self.graphics = try Graphics.init(self.a, surface);
+    var graphics = try Graphics.init(self.a, surface);
+    errdefer graphics.deinit();
+
+    var swapchain = try Swapchain.init(graphics, self.a, .{
+        .vsync = true,
+        .desired_extent = .{
+            // TODO: Intitial extent? Or should we defer swapchain initialization?
+            .width = 0,
+            .height = 0,
+        },
+        .swap_image_usage = .{
+            .color_attachment_bit = true,
+        },
+    });
+    errdefer swapchain.deinit(graphics);
+
+    self.gpu_state = .{
+        .graphics = graphics,
+        .swapchain = swapchain,
+    };
 }
 
 pub fn displayUnrealized(self: *Vulkan) void {
