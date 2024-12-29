@@ -19,6 +19,7 @@ pub const shadertoy = @import("renderer/shadertoy.zig");
 pub const Metal = @import("renderer/Metal.zig");
 pub const OpenGL = @import("renderer/OpenGL.zig");
 pub const WebGL = @import("renderer/WebGL.zig");
+pub const Vulkan = @import("renderer/Vulkan.zig");
 pub const Options = @import("renderer/Options.zig");
 pub const Thread = @import("renderer/Thread.zig");
 pub const State = @import("renderer/State.zig");
@@ -37,6 +38,7 @@ pub const Impl = enum {
     opengl,
     metal,
     webgl,
+    vulkan,
 
     pub fn default(
         target: std.Target,
@@ -59,6 +61,7 @@ pub const Renderer = switch (build_config.renderer) {
     .metal => Metal,
     .opengl => OpenGL,
     .webgl => WebGL,
+    .vulkan => Vulkan,
 };
 
 /// The health status of a renderer. These must be shared across all

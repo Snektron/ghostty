@@ -1324,10 +1324,6 @@ fn addDeps(
     }
 
     // Other dependencies, mostly pure Zig
-    step.root_module.addImport("opengl", b.dependency(
-        "opengl",
-        .{},
-    ).module("opengl"));
     step.root_module.addImport("vaxis", b.dependency("vaxis", .{
         .target = target,
         .optimize = optimize,
@@ -1354,6 +1350,27 @@ fn addDeps(
         .optimize = optimize,
         .with_tui = false,
     }).module("zf"));
+
+    // Renderer
+    switch (config.renderer) {
+        .opengl => {
+            step.root_module.addImport("opengl", b.dependency(
+                "opengl",
+                .{},
+            ).module("opengl"));
+        },
+        .metal => {},
+        .webgl => {},
+        .vulkan => {
+            const registry = b.dependency("vulkan_headers", .{}).path("registry/vk.xml");
+            const generator = b.dependency("vulkan_zig", .{}).artifact("vulkan-zig-generator");
+            const generate_cmd = b.addRunArtifact(generator);
+            generate_cmd.addFileArg(registry);
+            step.root_module.addAnonymousImport("vulkan", .{
+                .root_source_file = generate_cmd.addOutputFileArg("vk.zig"),
+            });
+        },
+    }
 
     // Mac Stuff
     if (step.rootModuleTarget().isDarwin()) {
