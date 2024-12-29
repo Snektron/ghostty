@@ -122,6 +122,7 @@ pub fn reinit(
     // be a little more efficient.
     graphics.dev.destroySwapchainKHR(old_handle, null);
 
+    self.a.free(self.images);
     self.images = try graphics.dev.getSwapchainImagesAllocKHR(self.handle, self.a);
 
     try self.createImageViews(graphics);

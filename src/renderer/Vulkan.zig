@@ -51,6 +51,9 @@ draw_background: terminal.color.RGB,
 /// The mailbox for communicating with the window.
 surface_mailbox: apprt.surface.Mailbox,
 
+/// The size of everything.
+size: renderer.Size,
+
 /// Vulkan GPU state.
 /// Initialization of the Vulkan GPU state is deferred until `finalizeSurfaceInit`,
 /// as we require the surface in order to pick the right rendering device.
@@ -61,6 +64,7 @@ const GPUState = struct {
     swapchain: Swapchain,
     frames: [frames_in_flight]Frame,
     frame_nr: usize = 0,
+    recreate_swapchain: bool = false,
 };
 
 pub const DerivedConfig = struct {
@@ -109,6 +113,7 @@ pub fn init(a: Allocator, options: renderer.Options) !Vulkan {
         .cursor_invert = options.config.cursor_invert,
         .draw_background = options.config.background,
         .surface_mailbox = options.surface_mailbox,
+        .size = options.size,
     };
 }
 
@@ -153,7 +158,7 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
     _ = surface;
 
     // We don't do anything else here because we want to set everything
-    // else up during actual initialization.
+    // up when both the renderer and the surface are available.
 }
 
 pub fn finalizeSurfaceInit(self: *Vulkan, surface: *apprt.Surface) !void {
@@ -163,9 +168,8 @@ pub fn finalizeSurfaceInit(self: *Vulkan, surface: *apprt.Surface) !void {
     var swapchain = try Swapchain.init(graphics, self.a, .{
         .vsync = true,
         .desired_extent = .{
-            // TODO: Intitial extent? Or should we defer swapchain initialization?
-            .width = 0,
-            .height = 0,
+            .width = self.size.screen.width,
+            .height = self.size.screen.height,
         },
         .swap_image_usage = .{
             .color_attachment_bit = true,
@@ -224,7 +228,9 @@ pub fn hasAnimations(self: *const Vulkan) bool {
 
 pub fn hasVsync(self: *const Vulkan) bool {
     _ = self;
-    return false; // TODO
+    // Vsync is managed by Vulkan, but the application still needs to
+    // manually submit frames.
+    return false;
 }
 
 pub fn markDirty(self: *Vulkan) void {
@@ -262,7 +268,7 @@ pub fn updateFrame(
     _ = cursor_blink_visible;
 }
 
-pub fn rebuildCells(
+fn rebuildCells(
     self: *Vulkan,
     rebuild: bool,
     screen: *terminal.Screen,
@@ -293,9 +299,8 @@ pub fn setScreenSize(
     self: *Vulkan,
     size: renderer.Size,
 ) !void {
-    _ = self;
-    _ = size;
-    // TODO
+    self.size = size;
+    if (self.gpu_state) |*state| state.recreate_swapchain = true;
 }
 
 pub fn drawFrame(self: *Vulkan, surface: *apprt.Surface) !void {
@@ -308,14 +313,50 @@ pub fn drawFrame(self: *Vulkan, surface: *apprt.Surface) !void {
 
     const cmd_buf = frame.cmd_buf;
 
-    const present_state = state.swapchain.acquireNextImage(state.graphics, frame.image_acquired) catch |err| switch (err) {
-        error.OutOfDateKHR => .suboptimal,
-        else => |other| return other,
-    };
+    // TODO: The current recreating logic causes black flickering when actually doing it
+    // I'm not really sure why that happens, but its probably related to recreating the
+    // swapchain the next frame, when it becomes suboptimal. It also looks like there is
+    // currently some delay in ghostty when changing resolution, which doesn't help.
+    while (true) {
+        if (!state.recreate_swapchain) {
+            const present_state = state.swapchain.acquireNextImage(state.graphics, frame.image_acquired) catch |err| switch (err) {
+                error.OutOfDateKHR => null,
+                else => |other| return other,
+            };
 
-    if (present_state == .suboptimal) {
-        // TODO: Check deferred size?
-        log.warn("TODO: Resize swapchain", .{});
+            if (present_state == null) {
+                // The swapchain is out of date; we need to recreate it directly.
+            } else if (present_state == .suboptimal) {
+                // We need to recreate the swapchain, but we've already signaled the frame's image_acquired semaphore.
+                // We can now either drop the frame, or schedule swapchain recreation for the next frame.
+                state.recreate_swapchain = true;
+                break;
+            } else {
+                break;
+            }
+        }
+
+        log.debug("resizing {}x{} => {}x{}", .{
+            state.swapchain.extent.width,
+            state.swapchain.extent.height,
+            self.size.screen.width,
+            self.size.screen.height,
+        });
+
+        try state.swapchain.reinit(state.graphics, .{
+            .vsync = true,
+            .desired_extent = .{
+                .width = self.size.screen.width,
+                .height = self.size.screen.height,
+            },
+            .swap_image_usage = .{
+                .color_attachment_bit = true,
+            },
+        });
+
+        state.recreate_swapchain = false;
+
+        // Try acquiring the frame again now that we've recreated the swapchain.
     }
 
     try dev.resetCommandPool(frame.cmd_pool, .{});
