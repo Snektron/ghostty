@@ -7,6 +7,7 @@ const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
 const vk = @import("vulkan");
 const glfw = @import("glfw");
+const glslang = @import("glslang");
 const apprt = @import("../../apprt.zig");
 const build_config = @import("../../build_config.zig");
 
@@ -28,7 +29,7 @@ const BaseDispatch = vk.BaseWrapper(apis);
 const Instance = vk.InstanceProxy(apis);
 const Device = vk.DeviceProxy(apis);
 
-a: Allocator,
+alloc: Allocator,
 
 vkb: BaseDispatch,
 instance: Instance,
@@ -64,7 +65,7 @@ fn addLayerIfSupported(
     log.warn("could not enable layer '{s}'", .{layer});
 }
 
-pub fn init(a: Allocator, surface: *apprt.Surface) !Graphics {
+pub fn init(alloc: Allocator, surface: *apprt.Surface) !Graphics {
     const vkb = try BaseDispatch.load(getInstanceProcAddrWrapper);
 
     const instance_exts = switch (apprt.runtime) {
@@ -82,12 +83,12 @@ pub fn init(a: Allocator, surface: *apprt.Surface) !Graphics {
         else => @compileError("unsupported app runtime for Vulkan"),
     };
 
-    var instance_layers = std.ArrayList([*:0]const u8).init(a);
+    var instance_layers = std.ArrayList([*:0]const u8).init(alloc);
     defer instance_layers.deinit();
 
     if (builtin.mode == .Debug) {
-        const available_layers = try vkb.enumerateInstanceLayerPropertiesAlloc(a);
-        defer a.free(available_layers);
+        const available_layers = try vkb.enumerateInstanceLayerPropertiesAlloc(alloc);
+        defer alloc.free(available_layers);
 
         try addLayerIfSupported(&instance_layers, available_layers, "VK_LAYER_KHRONOS_validation");
     }
@@ -109,8 +110,8 @@ pub fn init(a: Allocator, surface: *apprt.Surface) !Graphics {
         .pp_enabled_layer_names = instance_layers.items.ptr,
     }, null);
 
-    const vki = try a.create(Instance.Wrapper);
-    errdefer a.destroy(vki);
+    const vki = try alloc.create(Instance.Wrapper);
+    errdefer alloc.destroy(vki);
     vki.* = try Instance.Wrapper.load(vk_inst, vkb.dispatch.vkGetInstanceProcAddr);
     const instance = Instance.init(vk_inst, vki);
     errdefer instance.destroyInstance(null);
@@ -127,12 +128,12 @@ pub fn init(a: Allocator, surface: *apprt.Surface) !Graphics {
         else => unreachable,
     };
 
-    const candidate = try DeviceCandidate.pick(instance, vk_surface, a);
+    const candidate = try DeviceCandidate.pick(instance, vk_surface, alloc);
 
     log.info("initializing Vulkan device '{s}'", .{std.mem.sliceTo(&candidate.props.device_name, 0)});
     const vk_dev = try candidate.initDevice(instance);
-    const vkd = try a.create(Device.Wrapper);
-    errdefer a.destroy(vkd);
+    const vkd = try alloc.create(Device.Wrapper);
+    errdefer alloc.destroy(vkd);
     vkd.* = try Device.Wrapper.load(vk_dev, instance.wrapper.dispatch.vkGetDeviceProcAddr);
     const dev = Device.init(vk_dev, vkd);
     errdefer dev.destroyDevice(null);
@@ -142,7 +143,7 @@ pub fn init(a: Allocator, surface: *apprt.Surface) !Graphics {
     const mem_props = instance.getPhysicalDeviceMemoryProperties(candidate.pdev);
 
     return .{
-        .a = a,
+        .alloc = alloc,
         .vkb = vkb,
         .instance = instance,
         .surface = vk_surface,
@@ -157,14 +158,80 @@ pub fn init(a: Allocator, surface: *apprt.Surface) !Graphics {
 
 pub fn deinit(self: *Graphics) void {
     self.dev.destroyDevice(null);
-    self.a.destroy(self.dev.wrapper);
+    self.alloc.destroy(self.dev.wrapper);
 
     self.instance.destroySurfaceKHR(self.surface, null);
 
     self.instance.destroyInstance(null);
-    self.a.destroy(self.instance.wrapper);
+    self.alloc.destroy(self.instance.wrapper);
 
     self.* = undefined;
+}
+
+/// Mostly taken from shadertoy.zig's spirvFromGlsl
+pub fn compileShader(
+    graphics: Graphics,
+    src: [:0]const u8,
+    stage: enum { frag, vert },
+) !vk.ShaderModule {
+    const c = glslang.c;
+    const glsl_stage: c_uint = switch (stage) {
+        .vert => c.GLSLANG_STAGE_VERTEX,
+        .frag => c.GLSLANG_STAGE_FRAGMENT,
+    };
+    const input: c.glslang_input_t = .{
+        .language = c.GLSLANG_SOURCE_GLSL,
+        .stage = glsl_stage,
+        .client = c.GLSLANG_CLIENT_VULKAN,
+        .client_version = c.GLSLANG_TARGET_VULKAN_1_3,
+        .target_language = c.GLSLANG_TARGET_SPV,
+        .target_language_version = c.GLSLANG_TARGET_SPV_1_5,
+        .code = src.ptr,
+        .default_version = 100,
+        .default_profile = c.GLSLANG_NO_PROFILE,
+        .force_default_version_and_profile = 0,
+        .forward_compatible = 0,
+        .messages = c.GLSLANG_MSG_DEFAULT_BIT,
+        .resource = c.glslang_default_resource(),
+    };
+
+    const shader = try glslang.Shader.create(&input);
+    defer shader.delete();
+
+    shader.preprocess(&input) catch |err| {
+        log.err("failed to preprocess shader:", .{});
+        log.err("shader info: {s}", .{try shader.getInfoLog()});
+        log.err("shader debug info: {s}", .{try shader.getDebugInfoLog()});
+        return err;
+    };
+    shader.parse(&input) catch |err| {
+        log.err("failed to parse shader:", .{});
+        log.err("shader info: {s}", .{try shader.getInfoLog()});
+        log.err("shader debug info: {s}", .{try shader.getDebugInfoLog()});
+        return err;
+    };
+
+    const program = try glslang.Program.create();
+    defer program.delete();
+    program.addShader(shader);
+    program.link(c.GLSLANG_MSG_SPV_RULES_BIT | c.GLSLANG_MSG_VULKAN_RULES_BIT) catch |err| {
+        log.err("failed to link program:", .{});
+        log.err("program info: {s}", .{try program.getInfoLog()});
+        log.err("program debug info: {s}", .{try program.getDebugInfoLog()});
+        return err;
+    };
+    program.spirvGenerate(glsl_stage);
+
+    const spv = try graphics.alloc.alloc(u32, program.spirvGetSize());
+    defer graphics.alloc.free(spv);
+
+    program.spirvGet(spv);
+
+    return try graphics.dev.createShaderModule(&.{
+        .flags = .{},
+        .code_size = spv.len * @sizeOf(u32),
+        .p_code = spv.ptr,
+    }, null);
 }
 
 pub const Queue = struct {
@@ -196,16 +263,16 @@ const DeviceCandidate = struct {
     fn pick(
         instance: Instance,
         surface: vk.SurfaceKHR,
-        a: Allocator,
+        alloc: Allocator,
     ) !DeviceCandidate {
-        const pdevs = try instance.enumeratePhysicalDevicesAlloc(a);
-        defer a.free(pdevs);
+        const pdevs = try instance.enumeratePhysicalDevicesAlloc(alloc);
+        defer alloc.free(pdevs);
 
         var best_score: usize = 0;
         var best_candidate: ?DeviceCandidate = null;
 
         for (pdevs) |pdev| {
-            const candidate = try checkSuitable(instance, pdev, surface, a) orelse {
+            const candidate = try checkSuitable(instance, pdev, surface, alloc) orelse {
                 continue;
             };
 
@@ -269,9 +336,9 @@ const DeviceCandidate = struct {
         instance: Instance,
         pdev: vk.PhysicalDevice,
         surface: vk.SurfaceKHR,
-        a: Allocator,
+        alloc: Allocator,
     ) !?DeviceCandidate {
-        if (!try checkExtensionSupport(instance, pdev, a)) {
+        if (!try checkExtensionSupport(instance, pdev, alloc)) {
             return null;
         }
 
@@ -283,7 +350,7 @@ const DeviceCandidate = struct {
             return null;
         }
 
-        if (try allocateQueues(instance, pdev, surface, a)) |allocation| {
+        if (try allocateQueues(instance, pdev, surface, alloc)) |allocation| {
             const props = instance.getPhysicalDeviceProperties(pdev);
             return .{
                 .pdev = pdev,
@@ -299,10 +366,10 @@ const DeviceCandidate = struct {
         instance: Instance,
         pdev: vk.PhysicalDevice,
         surface: vk.SurfaceKHR,
-        a: Allocator,
+        alloc: Allocator,
     ) !?QueueAllocation {
-        const families = try instance.getPhysicalDeviceQueueFamilyPropertiesAlloc(pdev, a);
-        defer a.free(families);
+        const families = try instance.getPhysicalDeviceQueueFamilyPropertiesAlloc(pdev, alloc);
+        defer alloc.free(families);
 
         var maybe_graphics_family: ?u32 = null;
         var maybe_present_family: ?u32 = null;
@@ -349,10 +416,10 @@ const DeviceCandidate = struct {
     fn checkExtensionSupport(
         instance: Instance,
         pdev: vk.PhysicalDevice,
-        a: Allocator,
+        alloc: Allocator,
     ) !bool {
-        const propsv = try instance.enumerateDeviceExtensionPropertiesAlloc(pdev, null, a);
-        defer a.free(propsv);
+        const propsv = try instance.enumerateDeviceExtensionPropertiesAlloc(pdev, null, alloc);
+        defer alloc.free(propsv);
 
         for (required_device_extensions) |ext| {
             for (propsv) |props| {

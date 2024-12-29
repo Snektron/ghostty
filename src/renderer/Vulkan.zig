@@ -19,6 +19,7 @@ const terminal = @import("../terminal/main.zig");
 
 const Graphics = @import("vulkan/Graphics.zig");
 const Swapchain = @import("vulkan/Swapchain.zig");
+const CellPipeline = @import("vulkan/CellPipeline.zig");
 
 const frame_timeout = 1 * std.time.ns_per_s;
 const frames_in_flight = 3;
@@ -65,6 +66,7 @@ const GPUState = struct {
     frames: [frames_in_flight]Frame,
     frame_nr: usize = 0,
     recreate_swapchain: bool = false,
+    cell_pipeline: CellPipeline,
 };
 
 pub const DerivedConfig = struct {
@@ -134,6 +136,8 @@ pub fn deinit(self: *Vulkan) void {
         // (potentially in use) frame's resources.
         state.graphics.dev.queueWaitIdle(state.graphics.present_queue.handle) catch {};
 
+        state.cell_pipeline.deinit(state.graphics);
+
         for (&state.frames) |*frame| {
             frame.deinit(state.graphics);
         }
@@ -191,10 +195,14 @@ pub fn finalizeSurfaceInit(self: *Vulkan, surface: *apprt.Surface) !void {
         n_successfully_created += 1;
     }
 
+    const cell_pipeline = try CellPipeline.init(graphics, swapchain);
+    errdefer cell_pipeline.deinit(graphics);
+
     self.gpu_state = .{
         .graphics = graphics,
         .swapchain = swapchain,
         .frames = frames,
+        .cell_pipeline = cell_pipeline,
     };
 }
 
@@ -353,6 +361,8 @@ pub fn drawFrame(self: *Vulkan, surface: *apprt.Surface) !void {
                 .color_attachment_bit = true,
             },
         });
+
+        // TODO: Do we need to update the CellPipeline's color attachment format? Can this realistically change?
 
         state.recreate_swapchain = false;
 

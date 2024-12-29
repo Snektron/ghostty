@@ -79,7 +79,7 @@ pub fn reinit(
     const caps = try graphics.instance.getPhysicalDeviceSurfaceCapabilitiesKHR(graphics.pdev, graphics.surface);
     self.extent = findActualExtent(caps, create_info.desired_extent);
 
-    log.info("creating swapchain with extent {}x{}", .{ self.extent.width, self.extent.height });
+    log.debug("creating swapchain with extent {}x{}", .{ self.extent.width, self.extent.height });
 
     if (!caps.supported_usage_flags.contains(create_info.swap_image_usage)) {
         return error.UnsupportedSwapImageUsage;
