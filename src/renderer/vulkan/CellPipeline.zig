@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 const vk = @import("vulkan");
 const glslang = @import("glslang");
 
+const Vulkan = @import("../Vulkan.zig");
 const Graphics = @import("Graphics.zig");
 const Swapchain = @import("Swapchain.zig");
 
@@ -88,7 +89,7 @@ const PipelineLayout = struct {
         padding_vertical_bottom: u32,
     };
 
-    const bindings = [_]vk.DescriptorSetLayoutBinding {
+    const bindings = [_]vk.DescriptorSetLayoutBinding{
         // layout(set = 0, binding = 0) uniform sampler2D text
         .{
             .binding = 0,
@@ -107,6 +108,12 @@ const PipelineLayout = struct {
 };
 
 descriptor_set_layout: vk.DescriptorSetLayout,
+descriptor_pool: vk.DescriptorPool,
+/// We may be reallocating the textures bound here, and we cannot do that
+/// while a frame is still being used on the GPU. Therefore, we need to have
+/// a separate descriptor set for each frame. Take care that we need to keep
+/// track of pending updates per descriptor set.
+descriptor_sets: [Vulkan.frames_in_flight]vk.DescriptorSet,
 pipeline_layout: vk.PipelineLayout,
 pipeline: vk.Pipeline,
 
@@ -115,15 +122,55 @@ pub fn init(graphics: Graphics, swapchain: Swapchain) !CellPipeline {
 
     var self = CellPipeline{
         .descriptor_set_layout = .null_handle,
+        .descriptor_pool = .null_handle,
+        .descriptor_sets = undefined,
         .pipeline = .null_handle,
         .pipeline_layout = .null_handle,
     };
     errdefer self.deinit(graphics);
 
+    // initialize descriptor set layout
+
     self.descriptor_set_layout = try dev.createDescriptorSetLayout(&.{
         .binding_count = PipelineLayout.bindings.len,
         .p_bindings = &PipelineLayout.bindings,
     }, null);
+
+    // initialize descriptor pool
+
+    var pool_sizes = std.BoundedArray(vk.DescriptorPoolSize, PipelineLayout.bindings.len){};
+    for (PipelineLayout.bindings) |binding| {
+        for (pool_sizes.slice()) |*pool_size| {
+            if (pool_size.type == binding.descriptor_type) {
+                pool_size.descriptor_count += binding.descriptor_count * Vulkan.frames_in_flight;
+                break;
+            }
+        } else {
+            pool_sizes.appendAssumeCapacity(.{
+                .type = binding.descriptor_type,
+                .descriptor_count = binding.descriptor_count * Vulkan.frames_in_flight,
+            });
+        }
+    }
+
+    self.descriptor_pool = try dev.createDescriptorPool(&.{
+        .max_sets = Vulkan.frames_in_flight,
+        .pool_size_count = pool_sizes.len,
+        .p_pool_sizes = &pool_sizes.buffer,
+    }, null);
+
+    // allocate descriptor sets
+
+    var layouts: [Vulkan.frames_in_flight]vk.DescriptorSetLayout = undefined;
+    @memset(&layouts, self.descriptor_set_layout);
+
+    try dev.allocateDescriptorSets(&.{
+        .descriptor_pool = self.descriptor_pool,
+        .descriptor_set_count = layouts.len,
+        .p_set_layouts = &layouts,
+    }, &self.descriptor_sets);
+
+    // initialize pipeline
 
     const push_constant_range: vk.PushConstantRange = .{
         .stage_flags = .{
@@ -254,6 +301,8 @@ pub fn init(graphics: Graphics, swapchain: Swapchain) !CellPipeline {
 }
 
 pub fn deinit(self: *CellPipeline, graphics: Graphics) void {
+    // Freeing the pool also frees the descriptor sets.
+    graphics.dev.destroyDescriptorPool(self.descriptor_pool, null);
     graphics.dev.destroyDescriptorSetLayout(self.descriptor_set_layout, null);
     graphics.dev.destroyPipeline(self.pipeline, null);
     graphics.dev.destroyPipelineLayout(self.pipeline_layout, null);

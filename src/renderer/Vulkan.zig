@@ -24,8 +24,8 @@ const Graphics = @import("vulkan/Graphics.zig");
 const Swapchain = @import("vulkan/Swapchain.zig");
 const CellPipeline = @import("vulkan/CellPipeline.zig");
 
-const frame_timeout = 1 * std.time.ns_per_s;
-const frames_in_flight = 3;
+pub const frame_timeout = 1 * std.time.ns_per_s;
+pub const frames_in_flight = 3;
 
 alloc: Allocator,
 
