@@ -44,6 +44,10 @@ dev: Device,
 graphics_queue: Queue,
 present_queue: Queue,
 
+copy_cmd_pool: vk.CommandPool,
+copy_cmd_buf: vk.CommandBuffer,
+copy_fence: vk.Fence,
+
 fn getInstanceProcAddrWrapper(instance: vk.Instance, proc_name: [*:0]const u8) vk.PfnVoidFunction {
     return @ptrCast(glfw.getInstanceProcAddress(@ptrFromInt(@intFromEnum(instance)), proc_name));
 }
@@ -142,6 +146,22 @@ pub fn init(alloc: Allocator, surface: *apprt.Surface) !Graphics {
     const present_queue = Queue.init(dev, candidate.queues.present_family, candidate.queues.present_index);
     const mem_props = instance.getPhysicalDeviceMemoryProperties(candidate.pdev);
 
+    const copy_cmd_pool = try dev.createCommandPool(&.{
+        .flags = .{},
+        .queue_family_index = graphics_queue.family,
+    }, null);
+    errdefer dev.destroyCommandPool(copy_cmd_pool, null);
+
+    var copy_cmd_buf: vk.CommandBuffer = undefined;
+    try dev.allocateCommandBuffers(&.{
+        .command_pool = copy_cmd_pool,
+        .level = .primary,
+        .command_buffer_count = 1,
+    }, @ptrCast(&copy_cmd_buf));
+
+    const copy_fence = try dev.createFence(&.{}, null);
+    errdefer dev.destroyFence(copy_fence, null);
+
     return .{
         .alloc = alloc,
         .vkb = vkb,
@@ -153,10 +173,17 @@ pub fn init(alloc: Allocator, surface: *apprt.Surface) !Graphics {
         .dev = dev,
         .graphics_queue = graphics_queue,
         .present_queue = present_queue,
+        .copy_cmd_pool = copy_cmd_pool,
+        .copy_cmd_buf = copy_cmd_buf,
+        .copy_fence = copy_fence,
     };
 }
 
 pub fn deinit(self: *Graphics) void {
+    self.dev.destroyFence(self.copy_fence, null);
+    // Also destroys the copy_cmd_buf.
+    self.dev.destroyCommandPool(self.copy_cmd_pool, null);
+
     self.dev.destroyDevice(null);
     self.alloc.destroy(self.dev.wrapper);
 
@@ -232,6 +259,60 @@ pub fn compileShader(
         .code_size = spv.len * @sizeOf(u32),
         .p_code = spv.ptr,
     }, null);
+}
+
+pub fn findMemoryTypeIndex(self: Graphics, memory_type_bits: u32, flags: vk.MemoryPropertyFlags) !u32 {
+    for (self.mem_props.memory_types[0..self.mem_props.memory_type_count], 0..) |mem_type, i| {
+        if (memory_type_bits & (@as(u32, 1) << @truncate(i)) != 0 and mem_type.property_flags.contains(flags)) {
+            return @truncate(i);
+        }
+    }
+
+    return error.NoSuitableMemoryType;
+}
+
+pub fn allocate(self: Graphics, requirements: vk.MemoryRequirements, flags: vk.MemoryPropertyFlags) !vk.DeviceMemory {
+    return try self.dev.allocateMemory(&.{
+        .allocation_size = requirements.size,
+        .memory_type_index = try self.findMemoryTypeIndex(requirements.memory_type_bits, flags),
+    }, null);
+}
+
+pub fn copyBuffer(
+    self: Graphics,
+    dst: vk.Buffer,
+    src: vk.Buffer,
+    size: usize,
+) !void {
+    const dev = self.dev;
+
+    try dev.resetCommandPool(self.copy_cmd_pool, .{});
+    try dev.beginCommandBuffer(self.copy_cmd_buf, &.{
+        .flags = .{ .one_time_submit_bit = true },
+    });
+
+    const region: vk.BufferCopy = .{
+        .src_offset = 0,
+        .dst_offset = 0,
+        .size = size,
+    };
+    dev.cmdCopyBuffer(self.copy_cmd_buf, src, dst, 1, @ptrCast(&region));
+
+    try dev.endCommandBuffer(self.copy_cmd_buf);
+
+    const submit_info: vk.SubmitInfo = .{
+        .command_buffer_count = 1,
+        .p_command_buffers = @ptrCast(&self.copy_cmd_buf),
+        .p_wait_dst_stage_mask = &.{.{}},
+    };
+
+    try dev.queueSubmit(self.graphics_queue.handle, 1, @ptrCast(&submit_info), self.copy_fence);
+
+    const result = try dev.waitForFences(1, @ptrCast(&self.copy_fence), vk.TRUE, 1 * std.time.ns_per_s);
+    if (result == .timeout) {
+        return error.Timeout;
+    }
+    try dev.resetFences(1, @ptrCast(&self.copy_fence));
 }
 
 pub const Queue = struct {

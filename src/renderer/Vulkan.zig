@@ -23,6 +23,7 @@ const fgMode = @import("cell.zig").fgMode;
 const Graphics = @import("vulkan/Graphics.zig");
 const Swapchain = @import("vulkan/Swapchain.zig");
 const CellPipeline = @import("vulkan/CellPipeline.zig");
+const GpuBuffer = @import("vulkan/GpuBuffer.zig");
 
 pub const frame_timeout = 1 * std.time.ns_per_s;
 pub const frames_in_flight = 3;
@@ -96,6 +97,12 @@ const GPUState = struct {
     frame_nr: usize = 0,
     recreate_swapchain: bool = false,
     cell_pipeline: CellPipeline,
+
+    cells_bg: GpuBuffer,
+    cells_bg_written: usize = 0,
+
+    cells: GpuBuffer,
+    cells_written: usize = 0,
 };
 
 pub const DerivedConfig = struct {
@@ -224,6 +231,9 @@ pub fn deinit(self: *Vulkan) void {
         // (potentially in use) frame's resources.
         state.graphics.dev.queueWaitIdle(state.graphics.present_queue.handle) catch {};
 
+        state.cells_bg.deinit(state.graphics);
+        state.cells.deinit(state.graphics);
+
         state.cell_pipeline.deinit(state.graphics);
 
         for (&state.frames) |*frame| {
@@ -292,14 +302,32 @@ pub fn finalizeSurfaceInit(self: *Vulkan, surface: *apprt.Surface) !void {
         n_successfully_created += 1;
     }
 
-    const cell_pipeline = try CellPipeline.init(graphics, swapchain);
+    var cell_pipeline = try CellPipeline.init(graphics, swapchain);
     errdefer cell_pipeline.deinit(graphics);
+
+    var cells_bg = try GpuBuffer.init(
+        graphics,
+        16384,
+        .{ .transfer_dst_bit = true, .vertex_buffer_bit = true },
+        .{ .device_local_bit = true },
+    );
+    errdefer cells_bg.deinit(graphics);
+
+    var cells = try GpuBuffer.init(
+        graphics,
+        16384,
+        .{ .transfer_dst_bit = true, .vertex_buffer_bit = true },
+        .{ .device_local_bit = true },
+    );
+    errdefer cells.deinit(graphics);
 
     self.gpu_state = .{
         .graphics = graphics,
         .swapchain = swapchain,
         .frames = frames,
         .cell_pipeline = cell_pipeline,
+        .cells_bg = cells_bg,
+        .cells = cells,
     };
 }
 
@@ -577,7 +605,10 @@ fn rebuildCells(
     const arena_alloc = arena.allocator();
 
     // We've written no data to the GPU, refresh it all
-    // self.gl_cells_written = 0; // TODO
+    if (self.gpu_state) |*state| {
+        state.cells_written = 0;
+        state.cells_bg_written = 0;
+    }
 
     // Create our match set for the links.
     var link_match_set: link.MatchSet = if (mouse.point) |mouse_pt| try self.config.links.matchSet(
@@ -1498,10 +1529,46 @@ pub fn setScreenSize(
     if (self.gpu_state) |*state| state.recreate_swapchain = true;
 }
 
+fn uploadCells(
+    graphics: Graphics,
+    gpu_cells: *GpuBuffer,
+    cells_written: *usize,
+    cells: std.ArrayListUnmanaged(CellPipeline.Cell),
+) !void {
+    if (cells_written.* < cells.items.len) {
+        // Reallocate if necessary.
+        if (gpu_cells.size < cells.capacity) {
+            log.info("reallocating GPU buffer old={} new={}", .{
+                gpu_cells.size,
+                cells.capacity,
+            });
+
+            // TODO: Defer destruction of this type!!
+            gpu_cells.deinit(graphics);
+            gpu_cells.* = try GpuBuffer.init(
+                graphics,
+                cells.capacity,
+                .{ .transfer_dst_bit = true, .vertex_buffer_bit = true },
+                .{ .device_local_bit = true },
+            );
+        }
+
+        try gpu_cells.uploadWithStagingBuffer(
+            graphics,
+            std.mem.sliceAsBytes(cells.items),
+        );
+
+        cells_written.* = cells.items.len;
+    }
+}
+
 pub fn drawFrame(self: *Vulkan, surface: *apprt.Surface) !void {
     _ = surface;
     const state = if (self.gpu_state) |*state| state else return;
     const dev = state.graphics.dev;
+
+    try uploadCells(state.graphics, &state.cells_bg, &state.cells_bg_written, self.cells_bg);
+    try uploadCells(state.graphics, &state.cells, &state.cells_written, self.cells);
 
     const frame = &state.frames[state.frame_nr % frames_in_flight];
     try frame.wait(state.graphics);
