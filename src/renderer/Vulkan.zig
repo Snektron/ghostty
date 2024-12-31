@@ -19,11 +19,13 @@ const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 const isCovering = @import("cell.zig").isCovering;
 const fgMode = @import("cell.zig").fgMode;
+const math = @import("../math.zig");
 
 const Graphics = @import("vulkan/Graphics.zig");
 const Swapchain = @import("vulkan/Swapchain.zig");
 const CellPipeline = @import("vulkan/CellPipeline.zig");
 const GpuBuffer = @import("vulkan/GpuBuffer.zig");
+const GpuTexture = @import("vulkan/GpuTexture.zig");
 
 pub const frame_timeout = 1 * std.time.ns_per_s;
 pub const frames_in_flight = 3;
@@ -80,6 +82,10 @@ cells_viewport: ?terminal.Pin = null,
 font_grid: *font.SharedGrid,
 font_shaper: font.Shaper,
 font_shaper_cache: font.ShaperCache,
+texture_grayscale_modified: usize = 0,
+texture_grayscale_resized: usize = 0,
+texture_color_modified: usize = 0,
+texture_color_resized: usize = 0,
 
 /// Whether we're doing padding extension for vertical sides.
 padding_extend_top: bool = true,
@@ -102,6 +108,9 @@ const GPUState = struct {
 
     cells: GpuBuffer,
     cells_written: usize = 0,
+
+    atlas_grayscale: GpuTexture,
+    atlas_color: GpuTexture,
 };
 
 pub const DerivedConfig = struct {
@@ -230,6 +239,9 @@ pub fn deinit(self: *Vulkan) void {
         // (potentially in use) frame's resources.
         state.graphics.dev.queueWaitIdle(state.graphics.present_queue.handle) catch {};
 
+        state.atlas_grayscale.deinit(state.graphics);
+        state.atlas_color.deinit(state.graphics);
+
         state.cells_bg.deinit(state.graphics);
         state.cells.deinit(state.graphics);
 
@@ -320,6 +332,26 @@ pub fn finalizeSurfaceInit(self: *Vulkan, surface: *apprt.Surface) !void {
     );
     errdefer cells.deinit(graphics);
 
+    var atlas_grayscale = try GpuTexture.init(
+        graphics,
+        @intCast(self.font_grid.atlas_grayscale.size),
+        @intCast(self.font_grid.atlas_grayscale.size),
+        .r8_unorm,
+        .{ .transfer_dst_bit = true, .sampled_bit = true },
+        .{ .device_local_bit = true },
+    );
+    errdefer atlas_grayscale.deinit(graphics);
+
+    var atlas_color = try GpuTexture.init(
+        graphics,
+        @intCast(self.font_grid.atlas_color.size),
+        @intCast(self.font_grid.atlas_color.size),
+        .b8g8r8a8_unorm,
+        .{ .transfer_dst_bit = true, .sampled_bit = true },
+        .{ .device_local_bit = true },
+    );
+    errdefer atlas_color.deinit(graphics);
+
     self.gpu_state = .{
         .graphics = graphics,
         .swapchain = swapchain,
@@ -327,6 +359,8 @@ pub fn finalizeSurfaceInit(self: *Vulkan, surface: *apprt.Surface) !void {
         .cell_pipeline = cell_pipeline,
         .cells_bg = cells_bg,
         .cells = cells,
+        .atlas_grayscale = atlas_grayscale,
+        .atlas_color = atlas_color,
     };
 }
 
@@ -380,9 +414,24 @@ pub fn setVisible(self: *Vulkan, visible: bool) void {
 }
 
 pub fn setFontGrid(self: *Vulkan, grid: *font.SharedGrid) void {
-    _ = self;
-    _ = grid;
-    // TODO
+    // Reset our font grid
+    self.font_grid = grid;
+    self.grid_metrics = grid.metrics;
+    self.texture_grayscale_modified = 0;
+    self.texture_grayscale_resized = 0;
+    self.texture_color_modified = 0;
+    self.texture_color_resized = 0;
+
+    // Reset our shaper cache. If our font changed (not just the size) then
+    // the data in the shaper cache may be invalid and cannot be used, so we
+    // always clear the cache just in case.
+    const font_shaper_cache = font.ShaperCache.init();
+    self.font_shaper_cache.deinit(self.alloc);
+    self.font_shaper_cache = font_shaper_cache;
+
+    // Update our screen size because the font grid can affect grid
+    // metrics which update uniforms.
+    self.setScreenSize(self.size) catch unreachable;
 }
 
 pub fn updateFrame(
@@ -1567,18 +1616,94 @@ fn uploadCells(
     }
 }
 
+fn flushAtlas(
+    graphics: Graphics,
+    lock: *std.Thread.RwLock,
+    texture: *GpuTexture,
+    atlas: *font.Atlas,
+    modified: *usize,
+    resized: *usize,
+    format: vk.Format,
+) !void {
+    // If the texture isn't modified we do nothing
+    const new_modified = atlas.modified.load(.monotonic);
+    if (new_modified <= modified.*) return;
+
+    // If it is modified we need to grab a read-lock
+    lock.lockShared();
+    defer lock.unlockShared();
+
+    const new_resized = atlas.resized.load(.monotonic);
+    if (new_resized > resized.*) {
+        var new = try GpuTexture.init(
+            graphics,
+            @intCast(atlas.size),
+            @intCast(atlas.size),
+            format,
+            .{ .transfer_dst_bit = true, .sampled_bit = true },
+            .{ .device_local_bit = true },
+        );
+        errdefer new.deinit(graphics);
+
+        try new.uploadWithStagingBuffer(
+            graphics,
+            atlas.data,
+            @intCast(atlas.size),
+            @intCast(atlas.size),
+        );
+
+        // Only update the resized number after successful resize
+        resized.* = new_resized;
+        texture.deinit(graphics);
+        texture.* = new;
+    } else {
+        try texture.uploadWithStagingBuffer(
+            graphics,
+            atlas.data,
+            @intCast(atlas.size),
+            @intCast(atlas.size),
+        );
+    }
+
+    // Update our modified tracker after successful update
+    modified.* = atlas.modified.load(.monotonic);
+}
+
 pub fn drawFrame(self: *Vulkan, surface: *apprt.Surface) !void {
     _ = surface;
     const state = if (self.gpu_state) |*state| state else return;
     const dev = state.graphics.dev;
 
-    try uploadCells(state.graphics, &state.cells_bg, &state.cells_bg_written, self.cells_bg);
-    try uploadCells(state.graphics, &state.cells, &state.cells_written, self.cells);
-
     const frame = &state.frames[state.graphics.frameIndex()];
     try frame.wait(state.graphics);
 
     state.graphics.beginFrame();
+
+    try uploadCells(state.graphics, &state.cells_bg, &state.cells_bg_written, self.cells_bg);
+    try uploadCells(state.graphics, &state.cells, &state.cells_written, self.cells);
+
+    try flushAtlas(
+        state.graphics,
+        &self.font_grid.lock,
+        &state.atlas_grayscale,
+        &self.font_grid.atlas_grayscale,
+        &self.texture_grayscale_modified,
+        &self.texture_grayscale_resized,
+        .r8_unorm,
+    );
+
+    try flushAtlas(
+        state.graphics,
+        &self.font_grid.lock,
+        &state.atlas_color,
+        &self.font_grid.atlas_color,
+        &self.texture_color_modified,
+        &self.texture_color_resized,
+        .b8g8r8a8_unorm,
+    );
+
+    // TODO: Don't do this every frame...
+    try state.cell_pipeline.bindTextures(state.graphics, state.atlas_grayscale, state.atlas_color);
 
     const cmd_buf = frame.cmd_buf;
 
