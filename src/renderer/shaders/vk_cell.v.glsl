@@ -11,16 +11,16 @@ const uint MODE_FG_COLOR = 7u;
 const uint MODE_FG_POWERLINE = 15u;
 
 // The grid coordinates (x, y) where x < columns and y < rows
-layout(location = 0) in uvec2 grid_coord;
+layout(location = 0) in uvec2 grid_coord_in;
 
 // Position of the glyph in the texture.
-layout(location = 1) in uvec2 glyph_pos;
+layout(location = 1) in uvec2 glyph_pos_in;
 
 // Width/height of the glyph
-layout(location = 2) in uvec2 glyph_size;
+layout(location = 2) in uvec2 glyph_size_in;
 
 // Offset of the top-left corner of the glyph when rendered in a rect.
-layout(location = 3) in ivec2 glyph_offset;
+layout(location = 3) in ivec2 glyph_offset_in;
 
 // The color for this cell in RGBA (0 to 1.0). Background or foreground
 // depends on mode.
@@ -143,6 +143,12 @@ vec4 contrasted_color(float min_ratio, vec4 fg, vec4 bg) {
 //-------------------------------------------------------------------
 
 void main() {
+    // TODO: Can we remove some casts here?
+    vec2 grid_coord = grid_coord_in;
+    vec2 glyph_pos = glyph_pos_in;
+    vec2 glyph_size = glyph_size_in;
+    vec2 glyph_offset = glyph_offset_in;
+
     // We always forward our mode unmasked because the fragment
     // shader doesn't use any of the masks.
     mode = mode_in;
@@ -166,9 +172,21 @@ void main() {
     // 1 = bot-right
     // 2 = bot-left
     // 3 = top-left
+    //
+
+    int vertex;
+    switch (gl_VertexIndex) {
+    case 0: vertex = 0; break;
+    case 1: vertex = 1; break;
+    case 2: vertex = 3; break;
+    case 3: vertex = 1; break;
+    case 4: vertex = 2; break;
+    case 5: vertex = 3; break;
+    }
+
     vec2 position;
-    position.x = (gl_VertexIndex == 0 || gl_VertexIndex == 1) ? 1. : 0.;
-    position.y = (gl_VertexIndex == 0 || gl_VertexIndex == 3) ? 0. : 1.;
+    position.x = (vertex == 0 || vertex == 1) ? 1. : 0.;
+    position.y = (vertex == 0 || vertex == 3) ? 0. : 1.;
 
     // Scaled for wide chars
     vec2 cell_size_scaled = cell_size;
@@ -197,7 +215,8 @@ void main() {
         cell_pos = cell_pos + cell_size_scaled * position;
 
         gl_Position = projection * vec4(cell_pos, cell_z, 1.0);
-        color = color_in / 255.0;
+
+        color = color_in;
         break;
 
     case MODE_FG:
@@ -251,12 +270,14 @@ void main() {
         // since we want color glyphs to appear in their original color
         // and Powerline glyphs to be unaffected (else parts of the line would
         // have different colors as some parts are displayed via background colors).
-        vec4 color_final = color_in / 255.0;
+        vec4 color_final = color_in;
         if (min_contrast > 1.0 && mode == MODE_FG) {
-            vec4 bg_color = bg_color_in / 255.0;
+            vec4 bg_color = bg_color_in;
             color_final = contrasted_color(min_contrast, color_final, bg_color);
         }
         color = color_final;
         break;
     }
+
+    gl_Position.y *= -1; // TODO: Fix projection matrix
 }
