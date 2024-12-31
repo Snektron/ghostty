@@ -10,6 +10,7 @@ const glfw = @import("glfw");
 const glslang = @import("glslang");
 const apprt = @import("../../apprt.zig");
 const build_config = @import("../../build_config.zig");
+const Vulkan = @import("../Vulkan.zig");
 
 const required_device_extensions = [_][*:0]const u8{vk.extensions.khr_swapchain.name};
 
@@ -29,6 +30,14 @@ const BaseDispatch = vk.BaseWrapper(apis);
 const Instance = vk.InstanceProxy(apis);
 const Device = vk.DeviceProxy(apis);
 
+const DestructionQueue = std.ArrayListUnmanaged(DestructionQueueItem);
+const DestructionQueueItem = union(enum) {
+    swapchain: vk.SwapchainKHR,
+    buffer: vk.Buffer,
+    memory: vk.DeviceMemory,
+    image_View: vk.ImageView,
+};
+
 alloc: Allocator,
 
 vkb: BaseDispatch,
@@ -47,6 +56,10 @@ present_queue: Queue,
 copy_cmd_pool: vk.CommandPool,
 copy_cmd_buf: vk.CommandBuffer,
 copy_fence: vk.Fence,
+
+destruction_queues: [Vulkan.frames_in_flight]DestructionQueue = .{.{}} ** Vulkan.frames_in_flight,
+
+frame_nr: usize = 0,
 
 fn getInstanceProcAddrWrapper(instance: vk.Instance, proc_name: [*:0]const u8) vk.PfnVoidFunction {
     return @ptrCast(glfw.getInstanceProcAddress(@ptrFromInt(@intFromEnum(instance)), proc_name));
@@ -180,6 +193,11 @@ pub fn init(alloc: Allocator, surface: *apprt.Surface) !Graphics {
 }
 
 pub fn deinit(self: *Graphics) void {
+    for (&self.destruction_queues) |*queue| {
+        self.processDestructionQueue(queue);
+        queue.deinit(self.alloc);
+    }
+
     self.dev.destroyFence(self.copy_fence, null);
     // Also destroys the copy_cmd_buf.
     self.dev.destroyCommandPool(self.copy_cmd_pool, null);
@@ -193,6 +211,39 @@ pub fn deinit(self: *Graphics) void {
     self.alloc.destroy(self.instance.wrapper);
 
     self.* = undefined;
+}
+
+/// Should be called after waiting for the current frame.
+pub fn beginFrame(self: *Graphics) void {
+    // Go through the pending deletions buffer and process all those items.
+    const queue = &self.destruction_queues[self.frameIndex()];
+    self.processDestructionQueue(queue);
+}
+
+/// Should be called at the end of a frame.
+pub fn endFrame(self: *Graphics) void {
+    self.frame_nr += 1;
+}
+
+pub fn frameIndex(self: Graphics) usize {
+    return self.frame_nr % Vulkan.frames_in_flight;
+}
+
+fn processDestructionQueue(self: *Graphics, queue: *DestructionQueue) void {
+    const dev = self.dev;
+    for (queue.items) |item| {
+        switch (item) {
+            .swapchain => |swapchain| dev.destroySwapchainKHR(swapchain, null),
+            .buffer => |buffer| dev.destroyBuffer(buffer, null),
+            .memory => |memory| dev.freeMemory(memory, null),
+            .image_view => |image_view| dev.destroyImageView(image_view, null),
+        }
+    }
+    queue.items.len = 0;
+}
+
+pub fn destroyDeferred(self: *Graphics, item: DestructionQueueItem) !void {
+    try self.destruction_queues[self.frameIndex()].append(self.alloc, item);
 }
 
 /// Mostly taken from shadertoy.zig's spirvFromGlsl

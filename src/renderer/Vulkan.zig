@@ -94,7 +94,6 @@ const GPUState = struct {
     graphics: Graphics,
     swapchain: Swapchain,
     frames: [frames_in_flight]Frame,
-    frame_nr: usize = 0,
     recreate_swapchain: bool = false,
     cell_pipeline: CellPipeline,
 
@@ -240,7 +239,7 @@ pub fn deinit(self: *Vulkan) void {
             frame.deinit(state.graphics);
         }
 
-        state.swapchain.deinit(state.graphics);
+        state.swapchain.deinit(&state.graphics);
         state.graphics.deinit();
     }
 
@@ -276,7 +275,7 @@ pub fn finalizeSurfaceInit(self: *Vulkan, surface: *apprt.Surface) !void {
     var graphics = try Graphics.init(self.alloc, surface);
     errdefer graphics.deinit();
 
-    var swapchain = try Swapchain.init(graphics, self.alloc, .{
+    var swapchain = try Swapchain.init(&graphics, self.alloc, .{
         .vsync = true,
         .desired_extent = .{
             .width = self.size.screen.width,
@@ -286,7 +285,7 @@ pub fn finalizeSurfaceInit(self: *Vulkan, surface: *apprt.Surface) !void {
             .color_attachment_bit = true,
         },
     });
-    errdefer swapchain.deinit(graphics);
+    errdefer swapchain.deinit(&graphics);
 
     var frames: [frames_in_flight]Frame = undefined;
     var n_successfully_created: usize = 0;
@@ -1535,6 +1534,13 @@ fn uploadCells(
     cells_written: *usize,
     cells: std.ArrayListUnmanaged(CellPipeline.Cell),
 ) !void {
+    // TODO: This function is not correct currently. There
+    // is only a single buffer, and it is written to while it may still be in use!
+    // We don't need to create extra buffers, though, we can simply upload
+    // the contents asynchronously during normal rendering operations.
+    // If doing that, mind staging buffers and stuff. For now, it probably
+    // works ish...
+
     if (cells_written.* < cells.items.len) {
         // Reallocate if necessary.
         if (gpu_cells.size < cells.capacity) {
@@ -1543,7 +1549,6 @@ fn uploadCells(
                 cells.capacity,
             });
 
-            // TODO: Defer destruction of this type!!
             gpu_cells.deinit(graphics);
             gpu_cells.* = try GpuBuffer.init(
                 graphics,
@@ -1570,8 +1575,10 @@ pub fn drawFrame(self: *Vulkan, surface: *apprt.Surface) !void {
     try uploadCells(state.graphics, &state.cells_bg, &state.cells_bg_written, self.cells_bg);
     try uploadCells(state.graphics, &state.cells, &state.cells_written, self.cells);
 
-    const frame = &state.frames[state.frame_nr % frames_in_flight];
+    const frame = &state.frames[state.graphics.frameIndex()];
     try frame.wait(state.graphics);
+
+    state.graphics.beginFrame();
 
     const cmd_buf = frame.cmd_buf;
 
@@ -1581,7 +1588,7 @@ pub fn drawFrame(self: *Vulkan, surface: *apprt.Surface) !void {
     // currently some delay in ghostty when changing resolution, which doesn't help.
     while (true) {
         if (!state.recreate_swapchain) {
-            const present_state = state.swapchain.acquireNextImage(state.graphics, frame.image_acquired) catch |err| switch (err) {
+            const present_state = state.swapchain.acquireNextImage(&state.graphics, frame.image_acquired) catch |err| switch (err) {
                 error.OutOfDateKHR => null,
                 else => |other| return other,
             };
@@ -1605,7 +1612,7 @@ pub fn drawFrame(self: *Vulkan, surface: *apprt.Surface) !void {
             self.size.screen.height,
         });
 
-        try state.swapchain.reinit(state.graphics, .{
+        try state.swapchain.reinit(&state.graphics, .{
             .vsync = true,
             .desired_extent = .{
                 .width = self.size.screen.width,
@@ -1740,9 +1747,9 @@ pub fn drawFrame(self: *Vulkan, surface: *apprt.Surface) !void {
     };
     try dev.queueSubmit(state.graphics.graphics_queue.handle, 1, @ptrCast(&submit_info), frame.frame_fence);
 
-    try state.swapchain.present(state.graphics, &.{frame.render_finished});
+    try state.swapchain.present(&state.graphics, &.{frame.render_finished});
 
-    state.frame_nr += 1;
+    state.graphics.endFrame();
 }
 
 fn waitForAllFrames(self: *Vulkan) !void {

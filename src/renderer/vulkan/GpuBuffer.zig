@@ -74,7 +74,12 @@ pub fn uploadWithStagingBuffer(
     try graphics.copyBuffer(self.buffer, staging_buffer.buffer, data.len);
 }
 
-pub fn deinit(self: *GpuBuffer, graphics: Graphics) void {
+pub fn deinitDeferred(self: *GpuBuffer, graphics: *Graphics) !void {
+    try graphics.destroyDeferred(.{ .memory = self.memory });
+    try graphics.destroyDeferred(.{ .buffer = self.buffer });
+}
+
+pub fn deinit(self: *GpuBuffer, graphics: *Graphics) void {
     graphics.dev.freeMemory(self.memory, null);
     graphics.dev.destroyBuffer(self.buffer, null);
 }

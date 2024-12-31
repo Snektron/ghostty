@@ -38,7 +38,7 @@ image_index: u32,
 
 /// Attempt to initialize a new swapchain.
 pub fn init(
-    graphics: Graphics,
+    graphics: *Graphics,
     a: Allocator,
     create_info: CreateInfo,
 ) !Swapchain {
@@ -65,7 +65,7 @@ pub fn init(
 /// be called to deinitialize the swapchain regardless whether this function fails.
 pub fn reinit(
     self: *Swapchain,
-    graphics: Graphics,
+    graphics: *Graphics,
     create_info: CreateInfo,
 ) !void {
     self.surface_format = try findSurfaceFormat(graphics, create_info, self.a);
@@ -113,14 +113,14 @@ pub fn reinit(
         .composite_alpha = .{ .opaque_bit_khr = true },
         .present_mode = present_mode,
         .clipped = vk.TRUE,
-        .old_swapchain = self.handle,
+        .old_swapchain = old_handle,
     }, null);
 
-    // TODO: Destroy the handle *after* acquiring the first frame, the give the
+    // Destroy the handle *after* acquiring the first frame, the give the
     // presentation engine the opportunity to finish presenting to the old frames.
     // It's technically valid to nuke the swapchain at any point, but it should
     // be a little more efficient.
-    graphics.dev.destroySwapchainKHR(old_handle, null);
+    try graphics.destroyDeferred(.{ .swapchain = old_handle });
 
     self.a.free(self.images);
     self.images = try graphics.dev.getSwapchainImagesAllocKHR(self.handle, self.a);
@@ -130,7 +130,7 @@ pub fn reinit(
     self.image_index = undefined;
 }
 
-pub fn deinit(self: *Swapchain, graphics: Graphics) void {
+pub fn deinit(self: *Swapchain, graphics: *const Graphics) void {
     for (self.image_views) |view| {
         graphics.dev.destroyImageView(view, null);
     }
@@ -151,7 +151,7 @@ pub const PresentState = enum {
 /// swapchain state: If the swapchain should be recreated (because the window was moved to a monitor with a different)
 /// pixel layout, for example), .suboptimal is returned. When this function returns error.OutOfDateKHR (or .suboptimal)
 /// `self.reinit` should be called.
-pub fn acquireNextImage(self: *Swapchain, graphics: Graphics, image_acquired: vk.Semaphore) !PresentState {
+pub fn acquireNextImage(self: *Swapchain, graphics: *const Graphics, image_acquired: vk.Semaphore) !PresentState {
     const result = try graphics.dev.acquireNextImageKHR(self.handle, acquire_timeout, image_acquired, .null_handle);
     self.image_index = result.image_index;
 
@@ -166,7 +166,7 @@ pub fn acquireNextImage(self: *Swapchain, graphics: Graphics, image_acquired: vk
 
 /// Schedule the current swap image (self.image_index) for presentation. `wait_semaphores` is a list of
 /// semaphores to wait on before presentation.
-pub fn present(self: *Swapchain, graphics: Graphics, wait_semaphores: []const vk.Semaphore) !void {
+pub fn present(self: *Swapchain, graphics: *const Graphics, wait_semaphores: []const vk.Semaphore) !void {
     _ = try graphics.dev.queuePresentKHR(graphics.present_queue.handle, &.{
         .wait_semaphore_count = @intCast(wait_semaphores.len),
         .p_wait_semaphores = wait_semaphores.ptr,
@@ -178,9 +178,9 @@ pub fn present(self: *Swapchain, graphics: Graphics, wait_semaphores: []const vk
 }
 
 /// Create an image view for every swapchain image, and store them internally.
-fn createImageViews(self: *Swapchain, graphics: Graphics) !void {
+fn createImageViews(self: *Swapchain, graphics: *Graphics) !void {
     for (self.image_views) |view| {
-        graphics.dev.destroyImageView(view, null);
+        try graphics.destroyDeferred(.{ .image_view = view });
     }
 
     self.image_views = try self.a.realloc(self.image_views, self.images.len);
@@ -213,7 +213,7 @@ fn createImageViews(self: *Swapchain, graphics: Graphics) !void {
 }
 
 /// Query for a surface format that satisfies the requirements in `create_info`.
-fn findSurfaceFormat(graphics: Graphics, create_info: CreateInfo, a: Allocator) !vk.SurfaceFormatKHR {
+fn findSurfaceFormat(graphics: *const Graphics, create_info: CreateInfo, a: Allocator) !vk.SurfaceFormatKHR {
     const surface_formats = try graphics.instance.getPhysicalDeviceSurfaceFormatsAllocKHR(
         graphics.pdev,
         graphics.surface,
@@ -265,7 +265,7 @@ fn findSurfaceFormat(graphics: Graphics, create_info: CreateInfo, a: Allocator) 
 
 /// Find a present mode. Mailbox and immediate mode are preferred, and fifo is used as a
 /// fallback option.
-fn findPresentMode(graphics: Graphics, a: Allocator) !vk.PresentModeKHR {
+fn findPresentMode(graphics: *const Graphics, a: Allocator) !vk.PresentModeKHR {
     const present_modes = try graphics.instance.getPhysicalDeviceSurfacePresentModesAllocKHR(
         graphics.pdev,
         graphics.surface,
