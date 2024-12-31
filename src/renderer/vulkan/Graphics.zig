@@ -35,7 +35,7 @@ const DestructionQueueItem = union(enum) {
     swapchain: vk.SwapchainKHR,
     buffer: vk.Buffer,
     memory: vk.DeviceMemory,
-    image_View: vk.ImageView,
+    image_view: vk.ImageView,
 };
 
 alloc: Allocator,
@@ -348,6 +348,96 @@ pub fn copyBuffer(
         .size = size,
     };
     dev.cmdCopyBuffer(self.copy_cmd_buf, src, dst, 1, @ptrCast(&region));
+
+    try dev.endCommandBuffer(self.copy_cmd_buf);
+
+    const submit_info: vk.SubmitInfo = .{
+        .command_buffer_count = 1,
+        .p_command_buffers = @ptrCast(&self.copy_cmd_buf),
+        .p_wait_dst_stage_mask = &.{.{}},
+    };
+
+    try dev.queueSubmit(self.graphics_queue.handle, 1, @ptrCast(&submit_info), self.copy_fence);
+
+    const result = try dev.waitForFences(1, @ptrCast(&self.copy_fence), vk.TRUE, 1 * std.time.ns_per_s);
+    if (result == .timeout) {
+        return error.Timeout;
+    }
+    try dev.resetFences(1, @ptrCast(&self.copy_fence));
+}
+
+pub fn copyBufferToImage(
+    self: Graphics,
+    dst: vk.Image,
+    src: vk.Buffer,
+    width: u32,
+    height: u32,
+) !void {
+    const dev = self.dev;
+
+    try dev.resetCommandPool(self.copy_cmd_pool, .{});
+    try dev.beginCommandBuffer(self.copy_cmd_buf, &.{
+        .flags = .{ .one_time_submit_bit = true },
+    });
+
+    // TODO: Put this somewhere else.
+    {
+        const image_mbar: vk.ImageMemoryBarrier = .{
+            .src_access_mask = .{},
+            .dst_access_mask = .{ .transfer_write_bit = true },
+            .old_layout = .undefined,
+            .new_layout = .general,
+            .src_queue_family_index = self.graphics_queue.family,
+            .dst_queue_family_index = self.graphics_queue.family,
+            .image = dst,
+            .subresource_range = .{
+                .aspect_mask = .{ .color_bit = true },
+                .base_mip_level = 0,
+                .level_count = 1,
+                .base_array_layer = 0,
+                .layer_count = 1,
+            },
+        };
+        dev.cmdPipelineBarrier(
+            self.copy_cmd_buf,
+            .{ .top_of_pipe_bit = true },
+            .{ .transfer_bit = true },
+            .{},
+            0,
+            null,
+            0,
+            null,
+            1,
+            @ptrCast(&image_mbar),
+        );
+    }
+
+    const region: vk.BufferImageCopy = .{
+        .buffer_offset = 0,
+        .buffer_row_length = 0,
+        .buffer_image_height = 0,
+        .image_subresource = .{
+            .aspect_mask = .{ .color_bit = true },
+            .mip_level = 0,
+            .base_array_layer = 0,
+            .layer_count = 1,
+        },
+        .image_offset = .{ .x = 0, .y = 0, .z = 0 },
+        .image_extent = .{
+            .width = width,
+            .height = height,
+            .depth = 1,
+        },
+    };
+    dev.cmdCopyBufferToImage(
+        self.copy_cmd_buf,
+        src,
+        dst,
+        // Perhaps this should be configurable...
+        .general,
+        1,
+        @ptrCast(&region),
+    );
 
     try dev.endCommandBuffer(self.copy_cmd_buf);
 
