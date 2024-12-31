@@ -15,7 +15,9 @@
   qemu,
   scdoc,
   valgrind,
-  #, vulkan-loader # unused
+  vulkan-loader,
+  vulkan-tools,
+  vulkan-validation-layers,
   vttest,
   wabt,
   wasmtime,
@@ -51,6 +53,7 @@
   pandoc,
   hyperfine,
   typos,
+  renderdoc,
 }: let
   # See package.nix. Keep in sync.
   rpathLibs =
@@ -80,6 +83,8 @@
       libadwaita
       gtk4
       glib
+
+      vulkan-loader
     ];
 in
   mkShell {
@@ -153,6 +158,10 @@ in
         libadwaita
         gtk4
         glib
+
+        vulkan-tools
+        vulkan-validation-layers
+        renderdoc
       ];
 
     # This should be set onto the rpath of the ghostty binary if you want
