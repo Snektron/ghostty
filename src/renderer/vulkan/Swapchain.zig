@@ -236,7 +236,7 @@ fn findSurfaceFormat(graphics: *const Graphics, create_info: CreateInfo, a: Allo
     };
 
     const preferred = vk.SurfaceFormatKHR{
-        .format = .b8g8r8a8_srgb, // TODO: Maybe change for 10-bit monitors? Setting? What about the existing srgb setting?
+        .format = .b8g8r8a8_unorm, // TODO: Maybe change for 10-bit monitors? Setting? What about the existing srgb setting?
         .color_space = .srgb_nonlinear_khr,
     };
     var surface_format: ?vk.SurfaceFormatKHR = null;
