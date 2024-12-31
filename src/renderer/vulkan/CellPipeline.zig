@@ -11,16 +11,19 @@ const glslang = @import("glslang");
 const Vulkan = @import("../Vulkan.zig");
 const Graphics = @import("Graphics.zig");
 const Swapchain = @import("Swapchain.zig");
+const GpuTexture = @import("GpuTexture.zig");
+const GpuBuffer = @import("GpuBuffer.zig");
 
 pub const Cell = @import("../opengl/CellProgram.zig").Cell;
 pub const CellMode = @import("../opengl/CellProgram.zig").CellMode;
+pub const Params = PipelineLayout.PushConstants;
 
 // Keep in sync with both shaders.
 const PipelineLayout = struct {
     const binding_description = vk.VertexInputBindingDescription{
         .binding = 0,
         .stride = @sizeOf(Cell),
-        .input_rate = .vertex,
+        .input_rate = .instance,
     };
 
     const attributes = [_]vk.VertexInputAttributeDescription{
@@ -63,7 +66,7 @@ const PipelineLayout = struct {
         .{
             .binding = 0,
             .location = 6,
-            .format = .r32_uint,
+            .format = .r8_uint,
             .offset = @offsetOf(Cell, "mode"),
         },
         .{
@@ -117,6 +120,8 @@ descriptor_sets: [Vulkan.frames_in_flight]vk.DescriptorSet,
 pipeline_layout: vk.PipelineLayout,
 pipeline: vk.Pipeline,
 
+sampler: vk.Sampler,
+
 pub fn init(graphics: Graphics, swapchain: Swapchain) !CellPipeline {
     const dev = graphics.dev;
 
@@ -126,6 +131,7 @@ pub fn init(graphics: Graphics, swapchain: Swapchain) !CellPipeline {
         .descriptor_sets = undefined,
         .pipeline = .null_handle,
         .pipeline_layout = .null_handle,
+        .sampler = .null_handle,
     };
     errdefer self.deinit(graphics);
 
@@ -207,9 +213,9 @@ pub fn init(graphics: Graphics, swapchain: Swapchain) !CellPipeline {
     };
 
     const pcbas: vk.PipelineColorBlendAttachmentState = .{
-        .blend_enable = vk.FALSE,
+        .blend_enable = vk.TRUE,
         .src_color_blend_factor = .one,
-        .dst_color_blend_factor = .zero,
+        .dst_color_blend_factor = .one_minus_src_alpha,
         .color_blend_op = .add,
         .src_alpha_blend_factor = .one,
         .dst_alpha_blend_factor = .zero,
@@ -254,7 +260,7 @@ pub fn init(graphics: Graphics, swapchain: Swapchain) !CellPipeline {
             .depth_clamp_enable = vk.FALSE,
             .rasterizer_discard_enable = vk.FALSE,
             .polygon_mode = .fill,
-            .cull_mode = .{ .back_bit = true },
+            .cull_mode = .{},
             .front_face = .clockwise,
             .depth_bias_enable = vk.FALSE,
             .depth_bias_constant_factor = 0,
@@ -297,14 +303,123 @@ pub fn init(graphics: Graphics, swapchain: Swapchain) !CellPipeline {
         @ptrCast(&self.pipeline),
     );
 
+    self.sampler = try dev.createSampler(&.{
+        .flags = .{},
+        .mag_filter = .linear,
+        .min_filter = .linear,
+        .mipmap_mode = .linear,
+        .address_mode_u = .clamp_to_edge,
+        .address_mode_v = .clamp_to_edge,
+        .address_mode_w = .clamp_to_edge,
+        .mip_lod_bias = 0,
+        .anisotropy_enable = vk.FALSE,
+        .max_anisotropy = 0,
+        .compare_enable = vk.FALSE,
+        .compare_op = .always,
+        .min_lod = 0,
+        .max_lod = 0,
+        .border_color = .float_opaque_black,
+        .unnormalized_coordinates = vk.FALSE,
+    }, null);
+
     return self;
 }
 
 pub fn deinit(self: *CellPipeline, graphics: Graphics) void {
+    graphics.dev.destroySampler(self.sampler, null);
     // Freeing the pool also frees the descriptor sets.
     graphics.dev.destroyDescriptorPool(self.descriptor_pool, null);
     graphics.dev.destroyDescriptorSetLayout(self.descriptor_set_layout, null);
     graphics.dev.destroyPipeline(self.pipeline, null);
     graphics.dev.destroyPipelineLayout(self.pipeline_layout, null);
     self.* = undefined;
+}
+
+pub fn bindTextures(
+    self: *CellPipeline,
+    graphics: Graphics,
+    atlas_grayscale: GpuTexture,
+    atlas_color: GpuTexture,
+) !void {
+    const greyscale_info: vk.DescriptorImageInfo = .{
+        .sampler = self.sampler,
+        .image_view = atlas_grayscale.view,
+        .image_layout = .general, // TODO?
+    };
+
+    const color_info: vk.DescriptorImageInfo = .{
+        .sampler = self.sampler,
+        .image_view = atlas_color.view,
+        .image_layout = .general, // TODO?
+    };
+
+    // TODO: We need some deferred operation for this stuff...
+    // For now just ignore all of that stuff, because we are
+    // binding the texture each frame anyway.
+
+    const set = self.descriptor_sets[graphics.frameIndex()];
+    const writes = [_]vk.WriteDescriptorSet{
+        // layout(set = 0, binding = 0) uniform sampler2D text
+        .{
+            .dst_set = set,
+            .dst_binding = 0,
+            .dst_array_element = 0,
+            .descriptor_count = 1,
+            .descriptor_type = .combined_image_sampler,
+            .p_image_info = @ptrCast(&greyscale_info),
+            .p_buffer_info = undefined,
+            .p_texel_buffer_view = undefined,
+        },
+        // layout(set = 0, binding = 1) uniform sampler2D text_color
+        .{
+            .dst_set = set,
+            .dst_binding = 1,
+            .dst_array_element = 0,
+            .descriptor_count = 1,
+            .descriptor_type = .combined_image_sampler,
+            .p_image_info = @ptrCast(&color_info),
+            .p_buffer_info = undefined,
+            .p_texel_buffer_view = undefined,
+        },
+    };
+
+    graphics.dev.updateDescriptorSets(
+        @intCast(writes.len),
+        &writes,
+        0,
+        undefined,
+    );
+}
+
+pub fn draw(
+    self: *CellPipeline,
+    graphics: Graphics,
+    cmd_buf: vk.CommandBuffer,
+    cells: GpuBuffer,
+    len: usize,
+    params: Params,
+) !void {
+    const dev = graphics.dev;
+
+    dev.cmdBindPipeline(cmd_buf, .graphics, self.pipeline);
+    dev.cmdBindDescriptorSets(
+        cmd_buf,
+        .graphics,
+        self.pipeline_layout,
+        0,
+        1,
+        @ptrCast(&self.descriptor_sets[graphics.frameIndex()]),
+        0,
+        undefined,
+    );
+    dev.cmdPushConstants(
+        cmd_buf,
+        self.pipeline_layout,
+        .{ .vertex_bit = true, .fragment_bit = true },
+        0,
+        @sizeOf(PipelineLayout.PushConstants),
+        @ptrCast(&params),
+    );
+    dev.cmdBindVertexBuffers(cmd_buf, 0, 1, @ptrCast(&cells.buffer), &.{0});
+    dev.cmdDraw(cmd_buf, 6, @intCast(len), 0, 0);
 }

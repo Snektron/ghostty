@@ -96,6 +96,8 @@ padding_extend_bottom: bool = true,
 /// as we require the surface in order to pick the right rendering device.
 gpu_state: ?GPUState = null,
 
+cell_pipeline_params: CellPipeline.Params,
+
 const GPUState = struct {
     graphics: Graphics,
     swapchain: Swapchain,
@@ -129,6 +131,7 @@ pub const DerivedConfig = struct {
     selection_foreground: ?terminal.color.RGB,
     invert_selection_fg_bg: bool,
     bold_is_bright: bool,
+    min_contrast: f32,
     padding_color: configpkg.WindowPaddingColor,
     links: link.Set,
 
@@ -167,6 +170,7 @@ pub const DerivedConfig = struct {
             .background = config.background.toTerminalRGB(),
             .background_opacity = @max(0, @min(1, config.@"background-opacity")),
             .foreground = config.foreground.toTerminalRGB(),
+            .min_contrast = @floatCast(config.@"minimum-contrast"),
             .padding_color = config.@"window-padding-color",
             .invert_selection_fg_bg = config.@"selection-invert-fg-bg",
             .bold_is_bright = config.@"bold-is-bright",
@@ -219,6 +223,7 @@ pub fn init(alloc: Allocator, options: renderer.Options) !Vulkan {
         .font_grid = grid,
         .font_shaper = shaper,
         .font_shaper_cache = font.ShaperCache.init(),
+        .cell_pipeline_params = undefined,
     };
 }
 
@@ -1574,6 +1579,53 @@ pub fn setScreenSize(
     size: renderer.Size,
 ) !void {
     self.size = size;
+
+    const grid_size = self.size.grid();
+    const terminal_size = self.size.terminal();
+
+    // Blank space around the grid.
+    const blank: renderer.Padding = switch (self.config.padding_color) {
+        // We can use zero padding because the background color is our
+        // clear color.
+        .background => .{},
+
+        .extend, .@"extend-always" => self.size.screen.blankPadding(
+            self.size.padding,
+            grid_size,
+            self.size.cell,
+        ).add(self.size.padding),
+    };
+
+    const mat = math.ortho2d(
+        -1 * @as(f32, @floatFromInt(self.size.padding.left)),
+        @floatFromInt(terminal_size.width + self.size.padding.right),
+        @floatFromInt(terminal_size.height + self.size.padding.bottom),
+        -1 * @as(f32, @floatFromInt(self.size.padding.top)),
+    );
+
+    self.cell_pipeline_params = .{
+        // zig fmt: off
+        .projection = .{
+            mat[0][0], mat[0][1], mat[0][2], mat[0][3],
+            mat[1][0], mat[1][1], mat[1][2], mat[1][3],
+            mat[2][0], mat[2][1], mat[2][2], mat[2][3],
+            mat[3][0], mat[3][1], mat[3][2], mat[3][3],
+        },
+        // zig fmt: on
+        .grid_padding_x = @floatFromInt(blank.top),
+        .grid_padding_y = @floatFromInt(blank.right),
+        .grid_padding_z = @floatFromInt(blank.bottom),
+        .grid_padding_w = @floatFromInt(blank.left),
+        .grid_size_x = @floatFromInt(grid_size.columns),
+        .grid_size_y = @floatFromInt(grid_size.rows),
+        .cell_size_x = @floatFromInt(self.grid_metrics.cell_width),
+        .cell_size_y = @floatFromInt(self.grid_metrics.cell_height),
+        .min_contrast = self.config.min_contrast,
+        .padding_vertical_top = @intFromBool(self.padding_extend_top),
+        .padding_vertical_bottom = @intFromBool(self.padding_extend_bottom),
+    };
+
+    // TODO: Only if size changes
     if (self.gpu_state) |*state| state.recreate_swapchain = true;
 }
 
@@ -1760,6 +1812,24 @@ pub fn drawFrame(self: *Vulkan, surface: *apprt.Surface) !void {
         .flags = .{ .one_time_submit_bit = true },
     });
 
+    const extent = state.swapchain.extent;
+    const viewport = vk.Viewport{
+        .x = 0,
+        .y = 0,
+        .width = @floatFromInt(extent.width),
+        .height = @floatFromInt(extent.height),
+        .min_depth = 0,
+        .max_depth = 1,
+    };
+
+    const scissor = vk.Rect2D{
+        .offset = .{ .x = 0, .y = 0 },
+        .extent = extent,
+    };
+
+    dev.cmdSetViewport(cmd_buf, 0, 1, @ptrCast(&viewport));
+    dev.cmdSetScissor(cmd_buf, 0, 1, @ptrCast(&scissor));
+
     {
         // Dynamic rendering does not automatically transition the render pass into the present state.
         // We have to do that manually...
@@ -1823,6 +1893,9 @@ pub fn drawFrame(self: *Vulkan, surface: *apprt.Surface) !void {
         .color_attachment_count = 1,
         .p_color_attachments = @ptrCast(&color_attachment),
     });
+
+    try state.cell_pipeline.draw(state.graphics, cmd_buf, state.cells_bg, state.cells_bg_written, self.cell_pipeline_params);
+    try state.cell_pipeline.draw(state.graphics, cmd_buf, state.cells, state.cells_written, self.cell_pipeline_params);
 
     dev.cmdEndRendering(cmd_buf);
 

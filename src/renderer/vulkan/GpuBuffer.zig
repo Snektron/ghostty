@@ -38,6 +38,11 @@ pub fn init(
     };
 }
 
+pub fn deinit(self: *GpuBuffer, graphics: Graphics) void {
+    graphics.dev.freeMemory(self.memory, null);
+    graphics.dev.destroyBuffer(self.buffer, null);
+}
+
 pub fn map(self: *GpuBuffer, graphics: Graphics) ![]u8 {
     const ptr: [*]u8 = @ptrCast((try graphics.dev.mapMemory(self.memory, 0, vk.WHOLE_SIZE, .{})).?);
     return ptr[0..self.size];
@@ -72,14 +77,4 @@ pub fn uploadWithStagingBuffer(
     }
 
     try graphics.copyBuffer(self.buffer, staging_buffer.buffer, data.len);
-}
-
-pub fn deinitDeferred(self: *GpuBuffer, graphics: *Graphics) !void {
-    try graphics.destroyDeferred(.{ .memory = self.memory });
-    try graphics.destroyDeferred(.{ .buffer = self.buffer });
-}
-
-pub fn deinit(self: *GpuBuffer, graphics: *Graphics) void {
-    graphics.dev.freeMemory(self.memory, null);
-    graphics.dev.destroyBuffer(self.buffer, null);
 }
